@@ -3,8 +3,8 @@
 A Claude Code plugin that keeps a **deterministic, append-only checkpoint** of a
 conversation outside the model context window. It snapshots recent turns before
 Claude Code compacts, compresses code and prose cheaply, pins file paths and
-exported symbols in an entity ledger, and feeds a stable summary prefix back on
-the next prompt.
+exported symbols in an entity ledger, and feeds a stable, hard-capped summary
+prefix back immediately after compaction (with the next prompt as fallback).
 
 The design goal is **stable prefixes**, not promised cache-hit rates: summary
 blocks are generated once and never rewritten, master summaries are ordered
@@ -30,56 +30,40 @@ record and re-injects it as additional context, so:
 - L1 chunks are immutable, so already-sent prefixes stay byte-identical across
   turns (the prerequisite for provider prefix caching);
 - when six active chunks accumulate they are folded into an immutable L2
-  master, keeping the injected prefix bounded.
+  master, and the injected view is capped at 9,000 characters with a pinned
+  entity ledger at its head;
+- tool output is captured too, condensed to head/tail lines, collapsed
+  repetition and diagnostic lines, so large command results do not vanish
+  without their errors.
 
 ---
 
 ## Architecture
 
 ```
-        UserPromptSubmit (every prompt)              PreCompact
-                 │                                      │
-                 ▼                                      ▼
-        ┌─────────────────┐                   ┌────────────────────────┐
-        │ read hook JSON  │                   │ read transcript_path   │
-        │ from stdin      │                   │ JSONL: last N turns    │
-        └────────┬────────┘                   │ (default 24 / 24k chars)│
-                 │                            └───────────┬────────────┘
-                 ▼                                        ▼
-        ┌──────────────────────────────────────────────────────────┐
-        │ compression pipeline per turn                            │
-        │  fenced code → python-minifier / line-level / JSON       │
-        │  prose       → selective LLMLingua-2 with entity masks   │
-        │  ledger      → regex paths + exported/top-level symbols  │
-        └───────────────────────────┬──────────────────────────────┘
-                                    ▼
-                 ┌─────────────────────────────────────┐
-                 │ state  (~/.claude/append_compactor_ │
-                 │         state.json)  flock + atomic │
-                 └───────┬─────────────────────┬───────┘
-                         │                     │
-          append L1 chunk (immutable)    6 active L1?
-                         │                     │ yes
-                         ▼                     ▼
-              ┌────────────────────┐   ┌─────────────────────────┐
-              │ ### Summary Chunk  │   │ ### Consolidated Master │
-              │     #N (never      │   │   Summary (L2) #M       │
-              │     rewritten)     │   │ covers 6 chunks, union  │
-              └────────────────────┘   │ ledger + digests        │
-                         │             └─────────────────────────┘
-                         ▼
-              session armed? ── yes ──► injection_payload()
-                         │                 L2 masters first,
-                         │                 then active L1,
-                         │                 cache_control per block
-                         │                        │
-                         ▼                        ▼
-              append current prompt       UserPromptSubmit JSON
-              as L1, disarm               hookSpecificOutput.additionalContext
-
-PreCompact: append transcript turns as L1, arm session, print plain-text
-            Entity Ledger preservation instructions to stdout.
+UserPromptSubmit ─┐
+SessionStart      ├─► injection_payload() ──► hookSpecificOutput.additionalContext
+(compact)         │        │                      (hard 9k-char cap; Claude Code's
+                  │        ├─ pinned entity ledger    own wall is 10k per string)
+                  │        │  (stable head, 2k)
+                  │        ├─ newest L2 masters
+                  │        └─ newest active L1
+                  │
+PreCompact ───────┘  read transcript JSONL (last N turns + condensed tool results)
+        │
+        ├─► compression pipeline
+        │     fenced code → python-minifier / line-level / JSON
+        │     prose       → selective LLMLingua-2 with entity masks
+        │     ledger      → regex paths + exported/top-level symbols
+        ├─► append immutable L1 chunk; every 6 L1 → immutable L2 master
+        ├─► arm session
+        └─► print plain-text Entity Ledger preservation instructions to stdout
 ```
+
+The same state is read by all three hooks; PreCompact arms, and whichever of
+`SessionStart(compact)` or the next `UserPromptSubmit` runs first consumes the
+arm. The injected view is bounded and recency-prioritised; the stored L1/L2
+blocks are never rewritten.
 
 ---
 
@@ -126,17 +110,26 @@ dependencies into the system/user Python that `python3` resolves to.
 
 | Hook | Command | Reads | Writes | Output |
 | --- | --- | --- | --- | --- |
-| `PreCompact` | `append-compact.py --event precompact` | `transcript_path` JSONL, last `APPEND_COMPACT_PRECOMPACT_TURNS` user/assistant text blocks, capped at `APPEND_COMPACT_PRECOMPACT_CHARS` | Appends each turn as an L1 chunk (`source: precompact`), consolidates if needed, arms the session | **Plain text** on stdout. Claude Code appends successful PreCompact stdout to its compaction instructions. Not JSON. |
-| `UserPromptSubmit` | `append-compact.py --event prompt --inject` | Hook JSON on stdin (`session_id`, `prompt`) | If armed: builds injection from history **before** appending the prompt; always appends the prompt as an L1 chunk (`source: user_prompt`); disarms the session | JSON: `hookSpecificOutput.additionalContext` (functional in Claude Code), plus `additional_context`, `content_blocks` and `metadata` for custom routers |
+| `PreCompact` | `append-compact.py --event precompact` | `transcript_path` JSONL, last `APPEND_COMPACT_PRECOMPACT_TURNS` text turns, capped at `APPEND_COMPACT_PRECOMPACT_CHARS`, plus condensed `tool_result` / `toolUseResult` output (6k chars total) | Appends each turn as an L1 chunk (`source: precompact`), consolidates if needed, arms the session | **Plain text** on stdout. Current Claude Code versions append successful PreCompact stdout to their compaction instructions; treat that as best-effort, not a documented injection channel. |
+| `SessionStart` (matcher `compact`) | `append-compact.py --event sessionstart --inject` | Hook JSON on stdin (`session_id`, `source`) | If armed: injects once at the documented post-compaction point and disarms | JSON: `hookSpecificOutput.additionalContext` with `hookEventName: "SessionStart"` |
+| `UserPromptSubmit` | `append-compact.py --event prompt --inject` | Hook JSON on stdin (`session_id`, `prompt`) | If still armed (SessionStart did not fire): builds injection from history **before** appending the prompt; always appends the prompt as an L1 chunk (`source: user_prompt`); disarms | JSON: `hookSpecificOutput.additionalContext` (functional in Claude Code), plus `additional_context`, `content_blocks` and `metadata` for custom routers |
 | Manual | `append-compact.py --status` | State file | — | JSON status |
 | Manual | `append-compact.py --reset` | — | Replaces state with an empty one | JSON |
 | Manual | `append-compact.py --force-inject` | State file | — | Injection JSON regardless of arming |
 | Manual | `append-compact.py --self-test` | — | — | PASS/FAIL control lines; exit 1 on failure |
 
 Claude Code does not honor `hookSpecificOutput.customInstructions` on
-PreCompact (and PreCompact cannot inject context), which is why the handler
+PreCompact, and PreCompact cannot inject context, which is why the handler
 returns a plain string and `main()` writes it raw. The instruction text is
-capped at 4,000 characters, well under the 10,000-character hook-output limit.
+capped at 4,000 characters.
+
+**Hard output cap.** Claude Code caps each `additionalContext` string (and each
+`systemMessage`, `initialUserMessage`, and plain stdout) at **10,000
+characters**. Anything longer is written to a session file and replaced with
+the file path plus at most the first 2,000 characters, and Claude Code does not
+ask the model to read that file. There is no setting or environment variable to
+raise this cap. The plugin therefore defaults `APPEND_COMPACT_MAX_INJECT_CHARS`
+to 9,000 and clamps any larger value to 9,800.
 
 On `UserPromptSubmit`, exit 2 would block the prompt, so the hook never exits
 nonzero for internal errors: failures are appended to the error log and the
@@ -271,17 +264,20 @@ What the plugin guarantees:
   chunks are excluded from `active_l1` but remain in state.
 - **Block text has no timestamps.** Generated metadata may vary; the injected
   prefix text does not.
-- **Deterministic ordering.** Entity entries are sorted; L2 masters are emitted
-  oldest-first, then active L1 in chunk order.
-- **Bounded injection.** `APPEND_COMPACT_MAX_INJECT_CHARS` (default 60,000)
-  caps the payload. Oldest L2 masters are dropped first; if active L1 alone is
-  still too large it is truncated at a line/word boundary with an explicit
-  notice, never silently mid-line.
+- **Deterministic ordering.** Entity entries are sorted; selected L2 masters
+  stay chronological within the window, then active L1 in chunk order.
+- **Bounded injection.** `APPEND_COMPACT_MAX_INJECT_CHARS` (default **9,000**,
+  clamped to 9,800) caps the payload well under Claude Code's 10,000-character
+  hook-output wall. A deterministic `**Entity Ledger (pinned):**` head keeps
+  every captured path and symbol alive (2,000-char budget). The newest L2
+  masters and newest active L1 are kept; oldest material is dropped first, with
+  an explicit notice.
 
 These properties are what make the prefix suitable for provider-side prefix
-caching: the beginning of the injected context stays byte-identical as the
-conversation grows, while new material is appended at the end (volatile active
-L1 last).
+caching: stored blocks are append-only and never rewritten, so any injected
+text that remains in the conversation is byte-stable. The pinned ledger head
+changes only when a genuinely new entity appears; newer material is appended
+after it.
 
 ---
 
@@ -289,12 +285,12 @@ L1 last).
 
 ### What Claude Code actually does
 
-Claude Code reads only `hookSpecificOutput.additionalContext` from a
-`UserPromptSubmit` hook and injects it as a system reminder with the prompt. It
-**never forwards** the plugin's `content_blocks` and **ignores**
-`cache_control`. The `content_blocks` array (each block carrying
-`{"type": "ephemeral"}`) is emitted for downstream routers/proxies and tests,
-not for Claude Code itself.
+Claude Code reads only `hookSpecificOutput.additionalContext` from
+`UserPromptSubmit` / `SessionStart` hooks and injects it as a system reminder
+(at the prompt or at the start of the post-compaction conversation). It **never
+forwards** the plugin's `content_blocks` and **ignores** `cache_control`. The
+`content_blocks` array (each block carrying `{"type": "ephemeral"}`) is emitted
+for downstream routers/proxies and tests, not for Claude Code itself.
 
 The functional Claude Code shape is:
 
@@ -357,7 +353,7 @@ ignores them.
 | `APPEND_COMPACT_STATE` | `~/.claude/append_compactor_state.json` | State file path (overridden by `--state` when given) |
 | `APPEND_COMPACT_LLM` | enabled | Set to `0`/`false`/`off`/`no`/`disabled` to disable LLMLingua entirely (deterministic mode) |
 | `APPEND_COMPACT_LLM_MODEL` | `microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank` | Override the LLMLingua-2 model |
-| `APPEND_COMPACT_MAX_INJECT_CHARS` | `60000` | Hard cap on injected context; oldest L2 masters dropped first |
+| `APPEND_COMPACT_MAX_INJECT_CHARS` | `9000` | Hard cap on injected context, clamped to 9800 (Claude Code's per-string hook-output wall is 10,000); oldest material dropped first |
 | `APPEND_COMPACT_PRECOMPACT_TURNS` | `24` | Number of recent transcript turns captured on PreCompact |
 | `APPEND_COMPACT_PRECOMPACT_CHARS` | `24000` | Character cap for captured transcript text |
 | `APPEND_COMPACT_DEBUG` | off | Also write errors to stderr |
@@ -369,11 +365,11 @@ ignores them.
 ## Performance and cold start
 
 - **LLMLingua is lazy and heavy.** The first compressible paragraph triggers
-  `torch` plus model loading (seconds of CPU and gigabytes of RAM, and a model
-  download the first time). The `UserPromptSubmit` hook has a 60-second timeout;
-  a cold start can approach or exceed it on a loaded machine. Consider
-  `APPEND_COMPACT_LLM=0` for prompt hooks, or pre-warm the model outside the
-  hook. `PreCompact` has a 120-second timeout.
+  `torch` plus model loading (a measured cold start of ~40 s on one CPU machine,
+  including the model load; gigabytes of RAM, and a one-time model download).
+  Both hook timeouts are 60 s except `PreCompact` (120 s), so a cold start can
+  approach the limit on a loaded machine. Consider `APPEND_COMPACT_LLM=0`, or
+  pre-warm the model outside the hook.
 - **Code and JSON layers are CPU-only and fast**; they are safe to run on every
   turn.
 - The hook reads the transcript only on PreCompact, not on every prompt. It does
@@ -406,6 +402,10 @@ ignores them.
   not hit-rate promises.
 - **Masks are heuristics.** A compressor that loses a placeholder, changes
   entity extraction, or fails to shrink the text triggers the fallback.
+- **Tool condensation is lossy by design.** Tool results are reduced to
+  head/tail lines, collapsed repetition, and lines matching error/`file:line`
+  diagnostics, capped at 1,200 characters each and 6,000 total per compaction.
+  Unique but unremarkable output in the middle of a large result is dropped.
 
 ---
 
@@ -422,9 +422,11 @@ ignores them.
 The self-test includes controls in both directions: python-minifier shrinks
 valid code but leaves invalid code alone; entity extraction finds a known path
 and symbol but plain prose yields none; JSON compaction works and invalid JSON
-is untouched; L2 does not trigger at five chunks and does at six. The pytest
-suite uses `tmp_path` state, `llm="off"` and injected fake compressors, and never
-touches the real `~/.claude` state.
+is untouched; L2 does not trigger at five chunks and does at six; the injected
+payload stays under the hook cap and keeps the newest turns; the tool condenser
+collapses repeats, keeps error lines, and leaves short clean output unchanged.
+The pytest suite uses `tmp_path` state, `llm="off"` and injected fake
+compressors, and never touches the real `~/.claude` state.
 
 ---
 

@@ -12,6 +12,18 @@
         ]
       }
     ],
+    "SessionStart": [
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/append-compact.py\" --event sessionstart --inject",
+            "timeout": 60
+          }
+        ]
+      }
+    ],
     "UserPromptSubmit": [
       {
         "hooks": [

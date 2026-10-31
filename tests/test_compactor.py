@@ -422,7 +422,34 @@ def test_injection_cap_drops_oldest_master_first():
     assert len(text) <= 700
     assert payload["metadata"]["compactor"]["dropped_l2"] == 1
     assert "Consolidated Master Summary (L2) #1" not in text
-    assert text.endswith("[append-compactor: truncated to APPEND_COMPACT_MAX_INJECT_CHARS]")
+    assert text.endswith("[append-compactor: older context omitted to fit the 10k hook cap]")
+
+
+def test_injection_never_exceeds_hook_output_cap():
+    state = _fresh_state()
+    filler = "implementation detail " * 200
+    for index in range(30):
+        _append(state, f"turn {index} {filler} src/module_{index}.py")
+
+    payload = compactor.injection_payload(state, max_chars=1_000_000)
+    assert payload is not None
+    assert len(payload["additional_context"]) <= compactor.HOOK_OUTPUT_CAP - 200
+    assert payload["metadata"]["compactor"]["max_inject_chars"] <= compactor.HOOK_OUTPUT_CAP - 200
+
+
+def test_injection_keeps_newest_active_chunks():
+    state = _fresh_state()
+    filler = "implementation detail " * 40
+    for index in range(11):
+        _append(state, f"turn {index} {filler} src/module_{index}.py")
+    assert [c["n"] for c in compactor.active_l1(state)] == [7, 8, 9, 10, 11]
+
+    payload = compactor.injection_payload(state, max_chars=2_000)
+    text = payload["additional_context"]
+    assert len(text) <= 2_000
+    assert "Summary Chunk #11" in text       # newest turn survives
+    assert "Summary Chunk #7" not in text    # oldest active turns go first
+    assert payload["metadata"]["compactor"]["dropped_l1"] >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -550,3 +577,90 @@ def test_prompt_flag_does_not_read_stdin(tmp_path, monkeypatch):
     saved = compactor.load_state(state_path)
     assert len(saved["l1_chunks"]) == 1
     assert "src/manual.ts" in saved["l1_chunks"][0]["block"]
+
+
+# ---------------------------------------------------------------------------
+# Tool-result condensation and post-compaction injection
+# ---------------------------------------------------------------------------
+
+def test_condense_tool_output_strips_ansi_collapses_repeats_and_keeps_errors():
+    assert compactor.condense_tool_output("\x1b[31merror: boom\x1b[0m") == "error: boom"
+
+    noisy = "\n".join(
+        ["[INFO] waiting"] * 200
+        + ["src/app.py:42: AssertionError: expected 3"]
+        + ["done"] * 10
+    )
+    out = compactor.condense_tool_output(noisy)
+    assert "(×200)" in out
+    assert "src/app.py:42: AssertionError" in out
+    assert len(out) <= compactor.TOOL_RESULT_CHARS
+
+
+def test_condense_tool_output_is_bounded_for_long_unique_output():
+    long_output = "\n".join(f"line {index}" for index in range(500))
+    condensed = compactor.condense_tool_output(long_output)
+    assert len(condensed) <= compactor.TOOL_RESULT_CHARS
+    assert condensed.startswith("line 0")
+    assert condensed.rstrip().endswith("line 499")
+
+
+def test_transcript_tool_results_are_captured_and_condensed(tmp_path):
+    payload = "\n".join(
+        ["[INFO] polling"] * 200 + ["src/worker.ts:88: Error: socket closed"]
+    )
+    records = [
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Running the test suite"}],
+            },
+        },
+        {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "content": payload}],
+            },
+        },
+    ]
+    path = tmp_path / "transcript.jsonl"
+    path.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+
+    turns = compactor._read_transcript_turns(str(path), 24, 24_000)
+    tool_turns = [text for role, text in turns if role == "tool"]
+    assert len(tool_turns) == 1
+    assert "(×200)" in tool_turns[0]
+    assert "src/worker.ts:88: Error" in tool_turns[0]
+    assert len(tool_turns[0]) <= compactor.TOOL_RESULT_CHARS
+
+
+def test_sessionstart_injects_armed_session_once_and_disarms():
+    state = _state_with_master_and_active()
+    state.setdefault("armed_sessions", {})["s1"] = {"armed": True}
+    args = Namespace(force_inject=False, inject=True)
+
+    injected = compactor.handle_sessionstart_event(
+        state, {"session_id": "s1", "source": "compact"}, args
+    )
+    assert injected is not None
+    assert injected["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+    assert "Summary Chunk #7" in injected["hookSpecificOutput"]["additionalContext"]
+    assert "s1" not in state["armed_sessions"]
+
+    assert compactor.handle_sessionstart_event(state, {"session_id": "s1"}, args) is None
+
+
+def test_sessionstart_unarmed_session_is_not_injected():
+    state = _state_with_master_and_active()
+    args = Namespace(force_inject=False, inject=True)
+    assert compactor.handle_sessionstart_event(
+        state, {"session_id": "never-armed", "source": "compact"}, args
+    ) is None
+
+
+def test_hooks_json_registers_sessionstart_compact():
+    data = json.loads((REPO_ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+    entries = data["hooks"]["SessionStart"]
+    assert any(entry.get("matcher") == "compact" for entry in entries)

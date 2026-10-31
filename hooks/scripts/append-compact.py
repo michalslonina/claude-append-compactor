@@ -38,7 +38,7 @@ except ImportError:  # pragma: no cover - Windows fallback
     fcntl = None  # type: ignore[assignment]
 
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 SCHEMA_VERSION = 1
 PLUGIN_NAME = "claude-append-compactor"
 
@@ -46,7 +46,17 @@ DEFAULT_STATE_PATH = "~/.claude/append_compactor_state.json"
 L1_CONSOLIDATE_AT = 6
 DEFAULT_RATE = 0.4
 LLMLINGUA_MODEL = "microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank"
-DEFAULT_MAX_INJECT_CHARS = 60_000
+
+# Claude Code caps each hook output string (additionalContext, systemMessage,
+# plain stdout) at 10,000 characters and replaces anything longer with a file
+# path plus a 2,000-character preview; there is no setting to raise it.  Keep
+# the whole payload comfortably under that wall.
+HOOK_OUTPUT_CAP = 10_000
+DEFAULT_MAX_INJECT_CHARS = 9_000
+LEDGER_BUDGET_CHARS = 2_000
+TOOL_RESULT_CHARS = 1_200
+PRECOMPACT_TOOL_CHARS = 6_000
+
 DEFAULT_PRECOMPACT_TURNS = 24
 DEFAULT_PRECOMPACT_CHARS = 24_000
 MIN_PROSE_CHARS = 160
@@ -1034,44 +1044,115 @@ def _truncate_at_line(text: str, budget: int) -> str:
     return head.rstrip()
 
 
-def injection_payload(state: dict[str, Any], max_chars: int | None = None) -> dict[str, Any] | None:
-    """Ordered L2 masters followed by active L1 chunks, with cache markers."""
-    max_chars = max_chars or _env_int("APPEND_COMPACT_MAX_INJECT_CHARS", DEFAULT_MAX_INJECT_CHARS)
+def _clamp_inject_chars(max_chars: int) -> int:
+    """Never request more than Claude Code can deliver in one hook string."""
+    ceiling = HOOK_OUTPUT_CAP - 200
+    if max_chars <= 0:
+        return ceiling
+    return min(max_chars, ceiling)
+
+
+def _global_entities(state: dict[str, Any]) -> list[str]:
+    return _merge_entities(
+        *[chunk.get("entities", []) for chunk in state.get("l1_chunks", [])],
+        *[master.get("entities", []) for master in state.get("l2_masters", [])],
+    )
+
+
+def _global_ledger_block(state: dict[str, Any], limit: int) -> str:
+    """Deterministic union of every pinned entity, kept at the stable head.
+
+    Masters get dropped from the injection when the cap is tight, so this
+    ledger is what keeps old file paths and symbol names alive.
+    """
+    entities = _global_entities(state)
+    if not entities or limit <= 0:
+        return ""
+    header = "**Entity Ledger (pinned):**"
+    lines = [header]
+    used = len(header) + 1
+    for entry in entities:
+        line = f"- {entry}"
+        if used + len(line) + 1 > limit:
+            lines.append(f"- … {len(entities)} entities pinned, list truncated")
+            break
+        lines.append(line)
+        used += len(line) + 1
+    return "\n".join(lines)
+
+
+def _pack_recent(blocks: list[str], budget: int) -> tuple[str, int]:
+    """Keep the newest whole blocks that fit, dropping oldest first.
+
+    Returns ``(text, dropped_count)``.  When the newest block alone is over
+    budget, keep its tail rather than its head: the tail holds the most recent
+    lines of that turn.
+    """
+    if budget <= 0 or not blocks:
+        return "", len(blocks)
+    marker = "[… earlier part of this block truncated …]\n"
+    kept: list[str] = []
+    total = 0
+    dropped = 0
+    for block in reversed(blocks):
+        cost = len(block) + (2 if kept else 0)
+        if total + cost <= budget:
+            kept.append(block)
+            total += cost
+            continue
+        if not kept:
+            room = max(0, budget - len(marker))
+            tail = block[-room:] if room else ""
+            if room:
+                newline = tail.find("\n")
+                if 0 <= newline < len(tail) // 2:
+                    tail = tail[newline + 1:]
+            kept.append((marker + tail)[:budget])
+            dropped = len(blocks) - 1
+        else:
+            dropped = len(blocks) - len(kept)
+        break
+    kept.reverse()
+    return "\n\n".join(kept), dropped
+
+
+def injection_payload(
+    state: dict[str, Any],
+    max_chars: int | None = None,
+    event_name: str = "UserPromptSubmit",
+) -> dict[str, Any] | None:
+    """Bounded payload: pinned ledger head, newest L2 masters, newest active L1."""
+    max_chars = _clamp_inject_chars(
+        max_chars or _env_int("APPEND_COMPACT_MAX_INJECT_CHARS", DEFAULT_MAX_INJECT_CHARS)
+    )
     masters = [master["block"] for master in state.get("l2_masters", []) if master.get("block")]
     active = [chunk["block"] for chunk in active_l1(state) if chunk.get("block")]
     if not masters and not active:
         return None
 
-    dropped = 0
-    while masters and len("\n\n".join(masters + active)) > max_chars:
-        masters.pop(0)
-        dropped += 1
+    note = "\n\n[append-compactor: older context omitted to fit the 10k hook cap]"
+    ledger = _global_ledger_block(state, min(LEDGER_BUDGET_CHARS, max_chars // 4))
+    budget = max_chars - (len(ledger) + 2 if ledger else 0) - len(note)
 
-    master_text = "\n\n".join(masters)
-    active_text = "\n\n".join(active)
-    truncated = False
-    note = "\n\n[append-compactor: truncated to APPEND_COMPACT_MAX_INJECT_CHARS]"
-    if len("\n\n".join(part for part in (master_text, active_text) if part)) > max_chars:
-        truncated = True
-        budget = max_chars - len(note) - (len(master_text) + 2 if master_text else 0)
-        active_text = _truncate_at_line(active_text, budget)
-        if len("\n\n".join(part for part in (master_text, active_text) if part)) > max_chars - len(note):
-            # Extremely large master alone; keep only its stable head.
-            master_text = _truncate_at_line(master_text, max_chars - len(note))
-            active_text = ""
+    # Live turns outrank historical masters.
+    active_budget = budget if not masters else min(budget, max(1_500, budget // 2))
+    active_text, dropped_active = _pack_recent(active, active_budget)
+    remaining = budget - (len(active_text) + 2 if active_text else 0)
+    master_text, dropped_masters = _pack_recent(masters, remaining)
 
-    pieces = [part for part in (master_text, active_text) if part]
+    pieces = [part for part in (ledger, master_text, active_text) if part]
     text = "\n\n".join(pieces).strip()
-    if truncated:
+    if dropped_active or dropped_masters:
         text += note
-    if len(text) > max_chars:  # final hard guard
-        text = text[:max_chars]
+    if len(text) > max_chars:  # final hard guard; also keeps us under 10k
+        text = _truncate_at_line(text, max_chars)
 
     blocks: list[dict[str, Any]] = []
-    if master_text:
+    head_text = "\n\n".join(part for part in (ledger, master_text) if part)
+    if head_text:
         blocks.append({
             "type": "text",
-            "text": master_text,
+            "text": head_text,
             "cache_control": {"type": "ephemeral"},
         })
     if active_text:
@@ -1086,15 +1167,13 @@ def injection_payload(state: dict[str, Any], max_chars: int | None = None) -> di
             "text": text,
             "cache_control": {"type": "ephemeral"},
         })
-    if truncated:
-        blocks[-1]["text"] += note
 
     payload: dict[str, Any] = {
         # Requested flat shape (useful for custom routers/tests).
         "additional_context": text,
-        # Native Claude Code UserPromptSubmit hook shape.
+        # Native Claude Code hook shape (UserPromptSubmit or SessionStart).
         "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
+            "hookEventName": event_name,
             "additionalContext": text,
         },
         # Cache-aware consumers can use these blocks verbatim.
@@ -1105,7 +1184,9 @@ def injection_payload(state: dict[str, Any], max_chars: int | None = None) -> di
                 "version": VERSION,
                 "l2_masters": len(state.get("l2_masters", [])),
                 "active_l1": len(active),
-                "dropped_l2": dropped,
+                "dropped_l2": dropped_masters,
+                "dropped_l1": dropped_active,
+                "pinned_entities": len(_global_entities(state)),
                 "max_inject_chars": max_chars,
             }
         },
@@ -1119,6 +1200,53 @@ def injection_payload(state: dict[str, Any], max_chars: int | None = None) -> di
 # ---------------------------------------------------------------------------
 # Hook event handling
 # ---------------------------------------------------------------------------
+
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+TOOL_KEEP_RE = re.compile(
+    r"(?i)\b(?:error|exception|traceback|failed|failure|panic|fatal|assert\w*|"
+    r"expected|actual|warning)\b|[\w./\\-]+:\d+(?::\d+)?"
+)
+
+
+def condense_tool_output(text: str, max_chars: int = TOOL_RESULT_CHARS) -> str:
+    """Shrink a tool result without losing error lines or file:line anchors.
+
+    Strips ANSI escapes, collapses runs of identical lines, keeps the head and
+    tail, and retains middle lines that look like diagnostics.  This is the
+    only place tool output enters the summary: it is lossy, so it must stay
+    deterministic and bounded.
+    """
+    if not text:
+        return ""
+    cleaned = ANSI_ESCAPE_RE.sub("", text.replace("\r\n", "\n").replace("\r", "\n"))
+    lines = [line.rstrip() for line in cleaned.split("\n")]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines:
+        return ""
+
+    collapsed: list[str] = []
+    index = 0
+    while index < len(lines):
+        end = index
+        while end + 1 < len(lines) and lines[end + 1] == lines[index]:
+            end += 1
+        count = end - index + 1
+        line = lines[index]
+        collapsed.append(f"{line}  (×{count})" if count >= 3 and line.strip() else line)
+        index = end + 1
+
+    if len(collapsed) <= 80:
+        return _truncate_at_line("\n".join(collapsed), max_chars)
+    head = collapsed[:24]
+    tail = collapsed[-16:]
+    middle = collapsed[24:-16]
+    kept = [line for line in middle if TOOL_KEEP_RE.search(line)][:40]
+    out = head + [f"… {len(middle)} lines condensed …"] + kept + tail
+    return _truncate_at_line("\n".join(out), max_chars)
+
 
 def _read_transcript_turns(path: str | None, max_turns: int, max_chars: int) -> list[tuple[str, str]]:
     if not path:
@@ -1145,19 +1273,51 @@ def _read_transcript_turns(path: str | None, max_turns: int, max_chars: int) -> 
                     continue
                 content = message.get("content")
                 text = ""
+                tool_parts: list[str] = []
                 if isinstance(content, str):
                     text = content
                 elif isinstance(content, list):
-                    text = "\n".join(
-                        block.get("text", "")
-                        for block in content
-                        if isinstance(block, dict)
-                        and block.get("type") == "text"
-                        and isinstance(block.get("text"), str)
-                    )
+                    text_parts: list[str] = []
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        kind = block.get("type")
+                        if kind == "text" and isinstance(block.get("text"), str):
+                            text_parts.append(block["text"])
+                        elif kind == "tool_result":
+                            payload = block.get("content")
+                            raw = ""
+                            if isinstance(payload, str):
+                                raw = payload
+                            elif isinstance(payload, list):
+                                raw = "\n".join(
+                                    item.get("text", "") if isinstance(item, dict) else str(item)
+                                    for item in payload
+                                )
+                            condensed = condense_tool_output(raw)
+                            if condensed:
+                                tool_parts.append(condensed)
+                    text = "\n".join(text_parts)
+                if not tool_parts:
+                    # toolUseResult duplicates tool_result; use it only when the
+                    # structured block was absent, since it can carry extra data.
+                    result = record.get("toolUseResult")
+                    raw = ""
+                    if isinstance(result, str):
+                        raw = result
+                    elif isinstance(result, dict):
+                        try:
+                            raw = json.dumps(result, ensure_ascii=False)
+                        except (TypeError, ValueError):
+                            raw = ""
+                    condensed = condense_tool_output(raw)
+                    if condensed:
+                        tool_parts.append(condensed)
                 text = text.strip()
                 if text:
                     turns.append((role, text))
+                for tool_text in tool_parts:
+                    turns.append(("tool", tool_text))
     except OSError as exc:
         _log_error(f"cannot read transcript {transcript}: {exc!r}")
         return []
@@ -1173,7 +1333,18 @@ def _read_transcript_turns(path: str | None, max_turns: int, max_chars: int) -> 
         kept.append((role, text))
         total += len(text)
     kept.reverse()
-    return kept
+
+    # Tool output is supplementary: cap its total, preferring the newest.
+    tool_total = 0
+    limited: list[tuple[str, str]] = []
+    for role, text in reversed(kept):
+        if role == "tool":
+            if tool_total + len(text) > PRECOMPACT_TOOL_CHARS:
+                continue
+            tool_total += len(text)
+        limited.append((role, text))
+    limited.reverse()
+    return limited
 
 
 PRECOMPACT_INSTRUCTION_CAP = 4_000
@@ -1227,6 +1398,33 @@ def handle_prompt_event(
     if armed:
         state.get("armed_sessions", {}).pop(session, None)
     state["last_event"] = {"event": "UserPromptSubmit", "session_id": session, "at": _now()}
+    return output if (args.inject or args.force_inject) else None
+
+
+def handle_sessionstart_event(
+    state: dict[str, Any],
+    payload: dict[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, Any] | None:
+    """Inject armed context at SessionStart(matcher=compact).
+
+    This is the documented post-compaction injection point and removes the
+    one-prompt delay.  UserPromptSubmit stays as a fallback for versions where
+    SessionStart does not fire; whichever runs first consumes the arm.
+    """
+    session = str(payload.get("session_id") or "default")
+    armed = bool(state.get("armed_sessions", {}).get(session))
+    output = None
+    if args.force_inject or armed:
+        output = injection_payload(state, event_name="SessionStart")
+    if armed:
+        state.get("armed_sessions", {}).pop(session, None)
+    state["last_event"] = {
+        "event": "SessionStart",
+        "session_id": session,
+        "source": str(payload.get("source") or payload.get("matcher") or ""),
+        "at": _now(),
+    }
     return output if (args.inject or args.force_inject) else None
 
 
@@ -1316,6 +1514,34 @@ def self_test(verbose: bool = False) -> bool:
         'if (flag) {\n  print("sole child");\n}\n', "javascript"
     ))
 
+    bounded = injection_payload(probe, max_chars=10_000)
+    check(
+        "known-positive: injection clamped under the 10k hook cap",
+        bounded is not None and len(bounded["additional_context"]) <= HOOK_OUTPUT_CAP - 200,
+        str(len(bounded["additional_context"]) if bounded else 0),
+    )
+
+    deep = new_state()
+    for index in range(40):
+        append_turn(deep, f"turn {index} touches src/deep/module_{index}.py " + "detail " * 80, llm="off")
+    packed = injection_payload(deep, max_chars=3_000)
+    check(
+        "known-positive: cap keeps the newest turns, drops the oldest master",
+        packed is not None
+        and len(packed["additional_context"]) <= 3_000
+        and "Summary Chunk #40" in packed["additional_context"]
+        and "Consolidated Master Summary (L2) #1" not in packed["additional_context"]
+        and "**Entity Ledger (pinned):**" in packed["additional_context"],
+    )
+
+    noisy = "\n".join(["line ok"] * 30 + [f"src/app.py:{i}: failure in build" for i in range(5)])
+    condensed = condense_tool_output(noisy)
+    check(
+        "known-positive: tool condenser collapses repeats, keeps errors",
+        "(×30)" in condensed and "src/app.py:0: failure" in condensed and len(condensed) < len(noisy),
+    )
+    check("known-negative: short clean tool output unchanged", condense_tool_output("ok\n") == "ok")
+
     if verbose:
         for name, ok, detail in checks:
             status = "PASS" if ok else "FAIL"
@@ -1368,7 +1594,11 @@ def build_parser() -> argparse.ArgumentParser:
         prog="append-compact.py",
         description="Multilevel append-only compactor for Claude Code.",
     )
-    parser.add_argument("--event", choices=["auto", "prompt", "precompact"], default="auto")
+    parser.add_argument(
+        "--event",
+        choices=["auto", "prompt", "precompact", "sessionstart"],
+        default="auto",
+    )
     parser.add_argument("--inject", action="store_true", help="emit hook injection JSON when armed")
     parser.add_argument("--force-inject", action="store_true", help="emit injection JSON regardless of arming")
     parser.add_argument("--prompt", help="prompt text (otherwise read from hook stdin)")
@@ -1419,9 +1649,11 @@ def main(argv: list[str] | None = None) -> int:
                 event = "precompact"
             elif hook_name == "UserPromptSubmit":
                 event = "prompt"
+            elif hook_name == "SessionStart":
+                event = "sessionstart"
             else:
                 event = "none"
-    elif event == "precompact":
+    elif event in ("precompact", "sessionstart"):
         payload = _read_stdin_payload()
     elif event == "prompt" and args.prompt is None:
         payload = _read_stdin_payload()
@@ -1432,6 +1664,8 @@ def main(argv: list[str] | None = None) -> int:
             state = load_state(state_path)
             if event == "precompact":
                 output = handle_precompact_event(state, payload, args)
+            elif event == "sessionstart":
+                output = handle_sessionstart_event(state, payload, args)
             elif event == "prompt":
                 output = handle_prompt_event(state, payload, args)
             elif args.inject or args.force_inject:
