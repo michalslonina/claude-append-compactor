@@ -8,6 +8,7 @@ nothing touches the real ``~/.claude`` state file.
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib.util
 import json
 import os
@@ -48,7 +49,9 @@ ERROR_PROSE = (
 def isolated_environment(tmp_path, monkeypatch):
     """Keep logs and compressor globals test-local."""
     monkeypatch.setenv("APPEND_COMPACT_LOG", str(tmp_path / "error.log"))
+    monkeypatch.setenv("APPEND_COMPACT_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.delenv("APPEND_COMPACT_LLM", raising=False)
+    monkeypatch.delenv("APPEND_COMPACT_CACHE", raising=False)
     monkeypatch.delenv("OPENROUTER_EXTRA_HEADERS", raising=False)
     monkeypatch.setattr(compactor, "_compressor", None)
     monkeypatch.setattr(compactor, "_compressor_failed", False)
@@ -664,3 +667,156 @@ def test_hooks_json_registers_sessionstart_compact():
     data = json.loads((REPO_ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))
     entries = data["hooks"]["SessionStart"]
     assert any(entry.get("matcher") == "compact" for entry in entries)
+
+
+# ---------------------------------------------------------------------------
+# Content-addressed compression memo
+# ---------------------------------------------------------------------------
+
+def _fake_llm(calls: list, pattern: str = r"\b(carefully|several|expensive|future|fragile) "):
+    def fake(masked, rate, force_tokens):
+        calls.append(masked)
+        return re.sub(pattern, "", masked)
+
+    return fake
+
+
+def test_compression_memo_reuses_identical_text(monkeypatch):
+    calls = []
+    monkeypatch.setattr(compactor, "_default_llm_compress", _fake_llm(calls))
+    first = compactor.compress_prose(LONG_PROSE, llm="auto")
+    # A different compressor must not be consulted: the memo decides the bytes.
+    monkeypatch.setattr(compactor, "_default_llm_compress", _fake_llm(calls, r"\b(We|The) "))
+    second = compactor.compress_prose(LONG_PROSE, llm="auto")
+
+    assert first == second
+    assert first[1] == "llmlingua"
+    assert len(calls) == 1
+
+
+def test_compression_memo_distinguishes_different_text(monkeypatch):
+    calls = []
+    monkeypatch.setattr(compactor, "_default_llm_compress", _fake_llm(calls))
+    compactor.compress_prose(LONG_PROSE, llm="auto")
+    compactor.compress_prose(LONG_PROSE + " One more sentence about src/other.ts.", llm="auto")
+    assert len(calls) == 2
+
+
+def test_compression_memo_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("APPEND_COMPACT_CACHE", "0")
+    calls = []
+    monkeypatch.setattr(compactor, "_default_llm_compress", _fake_llm(calls))
+    compactor.compress_prose(LONG_PROSE, llm="auto")
+    compactor.compress_prose(LONG_PROSE, llm="auto")
+    assert len(calls) == 2
+    assert not list((Path(os.environ["APPEND_COMPACT_CACHE_DIR"])).rglob("*.json"))
+
+
+def test_compression_memo_ignores_corrupt_entries(monkeypatch):
+    key = compactor._compress_cache_key(
+        LONG_PROSE, compactor.DEFAULT_RATE, compactor.LLMLINGUA_MODEL
+    )
+    path = Path(os.environ["APPEND_COMPACT_CACHE_DIR"]) / "compressed" / key[:2] / f"{key}.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("{not json", encoding="utf-8")
+
+    calls = []
+    monkeypatch.setattr(compactor, "_default_llm_compress", _fake_llm(calls))
+    text, mode = compactor.compress_prose(LONG_PROSE, llm="auto")
+
+    assert mode == "llmlingua"
+    assert len(calls) == 1
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["schema"] == compactor.COMPRESS_CACHE_SCHEMA
+    assert data["text"] == text
+
+
+def test_compression_memo_is_not_used_for_callables():
+    calls = []
+    fake = _fake_llm(calls)
+    compactor.compress_prose(LONG_PROSE, llm=fake)
+    compactor.compress_prose(LONG_PROSE, llm=fake)
+    assert len(calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# Frozen shared block for multi-agent prefix reuse
+# ---------------------------------------------------------------------------
+
+def test_emit_shared_block_is_deterministic_and_frozen(tmp_path):
+    state = _state_with_master_and_active()
+    first = compactor.emit_shared_block(state, cache_dir=tmp_path / "cache")
+    second = compactor.emit_shared_block(state, cache_dir=tmp_path / "cache")
+
+    assert first["emitted"] is True
+    assert first["sha256"] == second["sha256"]
+    path = Path(first["shared_path"])
+    frozen = path.read_text(encoding="utf-8")
+    assert hashlib.sha256(frozen.encode("utf-8")).hexdigest() == first["sha256"]
+    assert "Consolidated Master Summary (L2) #1" in frozen
+    # Active L1 is per-agent recency and must never enter the shared block.
+    assert "Summary Chunk #7" not in frozen
+
+    for index in range(7, 12):
+        _append(state, f"turn {index} touches src/module_{index}.py")
+    assert len(state["l2_masters"]) == 2
+    assert path.read_text(encoding="utf-8") == frozen
+
+    third = compactor.emit_shared_block(state, cache_dir=tmp_path / "cache")
+    assert third["sha256"] != first["sha256"]
+    assert Path(third["shared_path"]).read_text(encoding="utf-8") != frozen
+
+
+def test_emit_shared_block_without_masters_emits_nothing(tmp_path):
+    result = compactor.emit_shared_block(_fresh_state(), cache_dir=tmp_path / "cache")
+    assert result["emitted"] is False
+    assert result["shared_path"] is None
+    assert result["sha256"] is None
+    assert result["l2_masters"] == 0
+    assert not (tmp_path / "cache" / "shared").exists()
+
+
+def test_shared_block_has_no_volatile_fields():
+    state = _state_with_master_and_active()
+    text = compactor.shared_block_text(state)
+    twin = _state_with_master_and_active()
+
+    assert text is not None
+    assert text == compactor.shared_block_text(twin)
+    assert not re.search(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", text)
+
+
+def test_shared_block_budget_keeps_newest_masters():
+    state = _fresh_state()
+    for index in range(24):
+        _append(
+            state,
+            f"turn {index} touches src/deep/module_{index}.py " + "detail " * 60,
+        )
+    assert len(state["l2_masters"]) == 4
+
+    text = compactor.shared_block_text(state, max_chars=5_000)
+    assert text is not None
+    assert len(text) <= 5_000
+    assert "(L2) #4" in text
+    assert "(L2) #1" not in text
+
+
+def test_cli_emit_shared_block_prints_path_and_hash(tmp_path):
+    state = _state_with_master_and_active()
+    state_path = tmp_path / "state.json"
+    compactor.save_state(state, state_path)
+
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT_PATH), "--emit-shared-block", "--state", str(state_path)],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "APPEND_COMPACT_CACHE_DIR": str(tmp_path / "cache")},
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["emitted"] is True
+    assert payload["l2_masters"] == 1
+    assert Path(payload["shared_path"]).exists()

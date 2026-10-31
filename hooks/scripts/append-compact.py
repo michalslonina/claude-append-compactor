@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import inspect
 import json
 import os
@@ -38,14 +39,21 @@ except ImportError:  # pragma: no cover - Windows fallback
     fcntl = None  # type: ignore[assignment]
 
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 SCHEMA_VERSION = 1
 PLUGIN_NAME = "claude-append-compactor"
 
 DEFAULT_STATE_PATH = "~/.claude/append_compactor_state.json"
+DEFAULT_CACHE_DIR = "~/.cache/append-compactor"
 L1_CONSOLIDATE_AT = 6
 DEFAULT_RATE = 0.4
 LLMLINGUA_MODEL = "microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank"
+
+# Compression results are content-addressed so parallel agents can share the
+# expensive LLMLingua work and receive byte-identical output for identical
+# input.  Bump the schema when the compression algorithm changes.
+COMPRESS_CACHE_SCHEMA = 1
+COMPRESS_CACHE_MAX_FILES = 4_096
 
 # Claude Code caps each hook output string (additionalContext, systemMessage,
 # plain stdout) at 10,000 characters and replaces anything longer with a file
@@ -56,6 +64,11 @@ DEFAULT_MAX_INJECT_CHARS = 9_000
 LEDGER_BUDGET_CHARS = 2_000
 TOOL_RESULT_CHARS = 1_200
 PRECOMPACT_TOOL_CHARS = 6_000
+SHARED_BLOCK_BANNER = (
+    "**Shared compacted context (append-compactor snapshot)**\n"
+    "Reuse this block verbatim; do not rewrite it."
+)
+SHARED_BLOCK_NOTE = "\n\n[append-compactor: older masters omitted to fit the shared block budget]"
 
 DEFAULT_PRECOMPACT_TURNS = 24
 DEFAULT_PRECOMPACT_CHARS = 24_000
@@ -146,6 +159,83 @@ def _atomic_write_json(path: Path, data: Any) -> None:
         with contextlib.suppress(OSError):
             os.unlink(tmp_name)
         raise
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, path)
+        with contextlib.suppress(OSError):
+            os.chmod(path, 0o600)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Content-addressed compression cache
+# ---------------------------------------------------------------------------
+
+def default_cache_dir() -> Path:
+    configured = os.environ.get("APPEND_COMPACT_CACHE_DIR", DEFAULT_CACHE_DIR)
+    return Path(configured).expanduser()
+
+
+def _cache_enabled() -> bool:
+    return _env_bool("APPEND_COMPACT_CACHE", True)
+
+
+def _compress_cache_key(text: str, rate: float, model: str) -> str:
+    digest = hashlib.sha256()
+    digest.update(f"append-compactor/compressed/v{COMPRESS_CACHE_SCHEMA}\0".encode("utf-8"))
+    digest.update(f"rate={rate:g}\0model={model}\0".encode("utf-8"))
+    digest.update(text.encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _read_cached_compression(path: Path) -> tuple[str, str] | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("schema") != COMPRESS_CACHE_SCHEMA:
+        return None
+    text, mode = data.get("text"), data.get("mode")
+    if not isinstance(text, str) or not text or not isinstance(mode, str):
+        return None
+    return text, mode
+
+
+def _write_cached_compression(path: Path, text: str, mode: str) -> None:
+    try:
+        _atomic_write_json(path, {"schema": COMPRESS_CACHE_SCHEMA, "text": text, "mode": mode})
+    except OSError as exc:  # a full disk must never break compaction
+        _log_error(f"compression cache write failed: {exc!r}")
+        return
+    _prune_compression_cache(path.parent.parent)
+
+
+def _prune_compression_cache(root: Path) -> None:
+    limit = _env_int("APPEND_COMPACT_CACHE_MAX_FILES", COMPRESS_CACHE_MAX_FILES)
+    try:
+        files = [entry for entry in root.rglob("*.json") if entry.is_file()]
+    except OSError:
+        return
+    if len(files) <= limit:
+        return
+    try:
+        files.sort(key=lambda entry: entry.stat().st_mtime)
+    except OSError:
+        return
+    for stale in files[: len(files) - limit]:
+        with contextlib.suppress(OSError):
+            stale.unlink()
 
 
 # ---------------------------------------------------------------------------
@@ -816,6 +906,22 @@ def compress_prose(
     if compressor is None:
         return normalized, "fallback"
 
+    # Only the built-in LLMLingua path is memoized: a caller-supplied callable
+    # may have side effects or vary, and "off" never reaches here.
+    cache_path: Path | None = None
+    if _cache_enabled() and compressor is _default_llm_compress:
+        try:
+            model = os.environ.get("APPEND_COMPACT_LLM_MODEL", LLMLINGUA_MODEL).strip() or LLMLINGUA_MODEL
+            key = _compress_cache_key(text, rate, model)
+            cache_path = default_cache_dir() / "compressed" / key[:2] / f"{key}.json"
+            cached = _read_cached_compression(cache_path)
+        except (OSError, RuntimeError, ValueError) as exc:
+            # A broken cache directory must degrade to a normal compression run.
+            _log_error(f"compression cache unavailable: {exc!r}")
+            cache_path, cached = None, None
+        if cached is not None:
+            return cached
+
     masked, placeholders, mapping = _mask_entities(text)
     try:
         compressed = compressor(masked, rate, placeholders)
@@ -830,7 +936,12 @@ def compress_prose(
         return normalized, "fallback-entity-mismatch"
     if len(restored) >= len(normalized):
         return normalized, "fallback-not-smaller"
-    return restored.strip(), "llmlingua"
+    result = restored.strip()
+    if cache_path is not None:
+        # Only successful model output is cached; deterministic fallbacks are
+        # cheap and caching them would freeze a transient model failure.
+        _write_cached_compression(cache_path, result, "llmlingua")
+    return result, "llmlingua"
 
 
 def _compress_prose_region(region: str, stats: dict[str, int], llm: Any) -> str:
@@ -1198,6 +1309,81 @@ def injection_payload(
 
 
 # ---------------------------------------------------------------------------
+# Frozen shared block (multi-agent prefix reuse)
+# ---------------------------------------------------------------------------
+
+def shared_block_text(state: dict[str, Any], max_chars: int | None = None) -> str | None:
+    """Render the ledger and L2 masters as one byte-stable block, or ``None``.
+
+    The block contains no timestamps, counters or session identifiers, so two
+    agents that render it from the same state get identical bytes.  Active L1
+    chunks are deliberately excluded: they are per-agent recency, and sharing
+    them would put different bytes at different offsets.
+    """
+    masters = [master["block"] for master in state.get("l2_masters", []) if master.get("block")]
+    if not masters:
+        return None
+    limit = max_chars or _env_int("APPEND_COMPACT_SHARED_CHARS", DEFAULT_MAX_INJECT_CHARS)
+    limit = max(limit, len(SHARED_BLOCK_BANNER) + 200)
+    ledger = _global_ledger_block(state, min(LEDGER_BUDGET_CHARS, limit // 4))
+    budget = (
+        limit
+        - len(SHARED_BLOCK_BANNER)
+        - 2
+        - (len(ledger) + 2 if ledger else 0)
+        - len(SHARED_BLOCK_NOTE)
+    )
+    master_text, dropped = _pack_recent(masters, budget)
+    pieces = [part for part in (SHARED_BLOCK_BANNER, ledger, master_text) if part]
+    text = "\n\n".join(pieces).strip()
+    if dropped:
+        text += SHARED_BLOCK_NOTE
+    if len(text) > limit:
+        text = _truncate_at_line(text, limit)
+    return text
+
+
+def emit_shared_block(
+    state: dict[str, Any],
+    max_chars: int | None = None,
+    cache_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Write the frozen block to ``<cache_dir>/shared/<sha256>.block``.
+
+    Content-addressed naming makes accidental drift visible: the same state
+    always yields the same path, and any change yields a new one.  An existing
+    file is never mutated in place, so a fan-out that already handed out a path
+    keeps reading the same bytes.
+    """
+    text = shared_block_text(state, max_chars=max_chars)
+    if text is None:
+        return {
+            "emitted": False,
+            "reason": "no L2 masters yet; nothing shared to freeze",
+            "shared_path": None,
+            "sha256": None,
+            "chars": 0,
+            "l2_masters": 0,
+            "pinned_entities": len(_global_entities(state)),
+        }
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    path = (cache_dir or default_cache_dir()) / "shared" / f"{digest}.block"
+    needs_write = True
+    with contextlib.suppress(OSError):
+        needs_write = path.read_text(encoding="utf-8") != text
+    if needs_write:
+        _atomic_write_text(path, text)
+    return {
+        "emitted": True,
+        "shared_path": str(path),
+        "sha256": digest,
+        "chars": len(text),
+        "l2_masters": len(state.get("l2_masters", [])),
+        "pinned_entities": len(_global_entities(state)),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Hook event handling
 # ---------------------------------------------------------------------------
 
@@ -1542,6 +1728,58 @@ def self_test(verbose: bool = False) -> bool:
     )
     check("known-negative: short clean tool output unchanged", condense_tool_output("ok\n") == "ok")
 
+    shared_first = shared_block_text(probe)
+    check(
+        "known-positive: shared block is byte-stable",
+        shared_first is not None
+        and shared_first == shared_block_text(probe)
+        and "Consolidated Master Summary" in shared_first,
+    )
+    check("known-negative: no L2 masters, no shared block", shared_block_text(new_state()) is None)
+
+    memo_prose = (
+        "We should carefully inspect src/app.ts before changing buildThing, because "
+        "the initialization sequence repeats several expensive checks on every request.\n\n"
+        "The team agreed to document each step so future readers can reproduce it."
+    )
+    with tempfile.TemporaryDirectory(prefix="append-compactor-selftest-") as memo_dir:
+        memo_calls: list[str] = []
+        original_compress = globals()["_default_llm_compress"]
+        original_cache_dir = os.environ.get("APPEND_COMPACT_CACHE_DIR")
+
+        def fake_compress(
+            text: str,
+            rate: float,
+            force_tokens: list[str],
+            *,
+            model: str | None = None,
+        ) -> str:
+            memo_calls.append(text)
+            return re.sub(r"\b(carefully|several|expensive|future) ", "", text)
+
+        try:
+            globals()["_default_llm_compress"] = fake_compress
+            os.environ["APPEND_COMPACT_CACHE_DIR"] = memo_dir
+            compress_prose(memo_prose, llm="auto")
+            compress_prose(memo_prose, llm="auto")
+            check(
+                "known-positive: memo serves a repeated paragraph once",
+                len(memo_calls) == 1,
+                str(len(memo_calls)),
+            )
+            compress_prose(memo_prose + " A different closing sentence.", llm="auto")
+            check(
+                "known-negative: different text misses the memo",
+                len(memo_calls) == 2,
+                str(len(memo_calls)),
+            )
+        finally:
+            globals()["_default_llm_compress"] = original_compress
+            if original_cache_dir is None:
+                os.environ.pop("APPEND_COMPACT_CACHE_DIR", None)
+            else:
+                os.environ["APPEND_COMPACT_CACHE_DIR"] = original_cache_dir
+
     if verbose:
         for name, ok, detail in checks:
             status = "PASS" if ok else "FAIL"
@@ -1605,6 +1843,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--state", help=f"state file (default: {DEFAULT_STATE_PATH})")
     parser.add_argument("--reset", action="store_true", help="replace the state with an empty one")
     parser.add_argument("--status", action="store_true", help="print state status as JSON")
+    parser.add_argument(
+        "--emit-shared-block",
+        action="store_true",
+        help="freeze ledger + L2 masters into a byte-stable file for multi-agent prefix reuse",
+    )
+    parser.add_argument("--shared-max-chars", type=int, help="cap for the emitted shared block")
     parser.add_argument("--no-llm", action="store_true", help="disable LLMLingua for this invocation")
     parser.add_argument("--self-test", action="store_true", help="run known-positive/negative controls")
     parser.add_argument("--version", action="store_true")
@@ -1635,6 +1879,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.status:
         state = load_state(state_path)
         print(json.dumps(status_of(state, state_path), indent=2, ensure_ascii=False))
+        return 0
+    if args.emit_shared_block:
+        state = load_state(state_path)
+        try:
+            result = emit_shared_block(state, max_chars=args.shared_max_chars)
+        except OSError as exc:
+            print(json.dumps({"emitted": False, "reason": f"write failed: {exc}"}, ensure_ascii=False))
+            return 1
+        print(json.dumps(result, ensure_ascii=False))
         return 0
 
     payload: dict[str, Any] = {}

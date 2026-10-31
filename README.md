@@ -281,6 +281,69 @@ after it.
 
 ---
 
+## Multi-agent prefix sharing
+
+Two mechanisms let parallel agents avoid duplicating work and, where the
+provider allows it, share a cached prefix.
+
+### Content-addressed compression memo
+
+Every successful LLMLingua result is stored by content hash under
+`~/.cache/append-compactor/compressed/<xx>/<sha256>.json`:
+
+- **Key:** `sha256(schema, rate, model, text)` — identical paragraphs map to
+  the same entry and the same bytes, in any session or agent.
+- **Value:** the final compressed text and mode. Only successful `llmlingua`
+  output is stored; deterministic fallbacks are cheap and never cached, so a
+  transient model failure cannot poison the cache.
+- **Misses are safe:** unreadable, empty or stale-schema entries are ignored
+  and rewritten.
+- **Bounded:** pruned to `APPEND_COMPACT_CACHE_MAX_FILES` (default 4,096)
+  oldest-first. `APPEND_COMPACT_CACHE=0` disables reads and writes.
+
+This removes duplicate model work across agents and makes output byte-identical
+for byte-identical input — which is what any prefix cache requires.
+
+### Frozen shared blocks
+
+`--emit-shared-block` renders the pinned ledger and every L2 master into one
+deterministic block, writes it to
+`~/.cache/append-compactor/shared/<sha256>.block`, and prints:
+
+```json
+{"emitted": true, "shared_path": ".../shared/0b3e....block", "sha256": "0b3e...", "chars": 4833, "l2_masters": 2, "pinned_entities": 12}
+```
+
+Give that file's contents to each subagent **verbatim at the head of its first
+message**:
+
+```sh
+python3 hooks/scripts/append-compact.py --emit-shared-block
+```
+
+Rules that make the cache win real:
+
+- **Fixed offset.** The block must precede every per-agent difference. Text
+  after the first divergence is never shared, whatever its content.
+- **Verbatim bytes.** Do not re-render, reformat or summarize it per agent.
+  Compare `sha256` across agents if a hit is unexpectedly missing.
+- **Frozen, not live.** Existing `<sha>.block` files are never mutated; a state
+  change produces a new path, so an in-flight fan-out keeps reading the same
+  bytes.
+- **No active L1.** Per-agent recency is deliberately excluded; it differs by
+  construction and would destroy byte alignment.
+- **Cap.** Default `9,000` characters (`--shared-max-chars` or
+  `APPEND_COMPACT_SHARED_CHARS`). Oldest masters are dropped first.
+- **No masters, no block.** Before the first consolidation the command reports
+  `"emitted": false` — there is nothing shared to freeze.
+
+The saving is bounded and secondary: the block is billed once per agent at the
+provider's cache-read rate, and only after the first agent has warmed it.
+Correctness is the real cost — a digest computed for one agent's task can carry
+irrelevant or private detail into another agent's context.
+
+---
+
 ## cache_control, OpenRouter and model routing
 
 ### What Claude Code actually does
@@ -356,6 +419,10 @@ ignores them.
 | `APPEND_COMPACT_MAX_INJECT_CHARS` | `9000` | Hard cap on injected context, clamped to 9800 (Claude Code's per-string hook-output wall is 10,000); oldest material dropped first |
 | `APPEND_COMPACT_PRECOMPACT_TURNS` | `24` | Number of recent transcript turns captured on PreCompact |
 | `APPEND_COMPACT_PRECOMPACT_CHARS` | `24000` | Character cap for captured transcript text |
+| `APPEND_COMPACT_CACHE` | enabled | Set to `0`/`false`/`off` to disable the compression memo (reads and writes) |
+| `APPEND_COMPACT_CACHE_DIR` | `~/.cache/append-compactor` | Root for the compression memo and frozen shared blocks |
+| `APPEND_COMPACT_CACHE_MAX_FILES` | `4096` | Memo entries kept; oldest are pruned first |
+| `APPEND_COMPACT_SHARED_CHARS` | `9000` | Default cap for `--emit-shared-block` |
 | `APPEND_COMPACT_DEBUG` | off | Also write errors to stderr |
 | `APPEND_COMPACT_LOG` | `~/.cache/append-compactor/error.log` | Error log path (rotated at 5 MB) |
 | `OPENROUTER_EXTRA_HEADERS` | unset | JSON object or `Key: Value, ...` list emitted under `metadata.openrouter_extra_headers` for a custom gateway; inert in direct setups |
