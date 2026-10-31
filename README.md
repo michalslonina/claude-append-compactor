@@ -69,6 +69,25 @@ blocks are never rewritten.
 
 ## Install
 
+### From the marketplace (recommended)
+
+```sh
+claude plugin marketplace add michalslonina/claude-append-compactor
+claude plugin install claude-append-compactor@claude-append-compactor
+```
+
+From a local checkout, add the directory instead:
+
+```sh
+claude plugin marketplace add /path/to/claude-append-compactor
+claude plugin install claude-append-compactor@claude-append-compactor
+```
+
+Install the Python dependencies into the interpreter the hooks resolve (see
+below), then reload plugins with `/reload-plugins`, or restart Claude Code.
+
+### From a checkout without a marketplace
+
 ```sh
 git clone https://github.com/michalslonina/claude-append-compactor
 cd claude-append-compactor
@@ -79,14 +98,28 @@ pip install -r requirements.txt
 # from any project, load the plugin for this session:
 claude --plugin-dir "$PWD"
 
-# optional manifest/hook validation:
+# optional manifest/marketplace validation:
 claude plugin validate .
 ```
 
 The hook commands call `python3 ...`, so the interpreter on `PATH` must be the
 one with the dependencies installed. Activating the venv before launching
 Claude Code is the simplest way to guarantee that; alternatively install the
-dependencies into the system/user Python that `python3` resolves to.
+dependencies into the system/user Python that `python3` resolves to:
+
+```sh
+python3 -m pip install --user -r requirements.txt   # add --break-system-packages on PEP 668 systems
+```
+
+A CPU-only PyTorch is enough — the compactor runs LLMLingua on CPU. On a
+PEP 668 system, installing it first keeps pip from pulling the multi-gigabyte
+CUDA wheel:
+
+```sh
+python3 -m pip install --user --break-system-packages \
+  --index-url https://download.pytorch.org/whl/cpu torch
+python3 -m pip install --user --break-system-packages -r requirements.txt
+```
 
 `claude --plugin-dir` loads `hooks/hooks.json` automatically. Do **not** add a
 `hooks` field to `plugin.json`; that would register the hooks twice.

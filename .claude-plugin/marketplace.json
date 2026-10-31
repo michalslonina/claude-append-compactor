@@ -1,0 +1,20 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "claude-append-compactor",
+  "owner": {
+    "name": "claude-append-compactor contributors"
+  },
+  "metadata": {
+    "description": "Multilevel append-only context compactor with LLMLingua-2, line-level code minification, and entity pinning for Claude Code",
+    "version": "1.4.0"
+  },
+  "plugins": [
+    {
+      "name": "claude-append-compactor",
+      "source": "./",
+      "description": "Append-only L1/L2 context summaries with selective LLMLingua-2 compression, deterministic entity pinning, and a hard 10k hook-output cap.",
+      "category": "context",
+      "tags": ["context", "compaction", "llmlingua", "prompt-caching", "hooks"]
+    }
+  ]
+}
