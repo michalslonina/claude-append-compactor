@@ -11,6 +11,11 @@ turns outside the model context window.  It combines three compression layers:
 * deterministic entity pinning and L1/L2 summary blocks that are never
   rewritten, so the injected prefix stays stable for provider KV caching.
 
+Hooks capture turns into a queue and return; detached worker processes (one
+machine-wide pool, serialised by flock) compress them off the hook path.  Every
+chunk, master and queued job carries its session id, so parallel Claude Code
+contexts sharing this state never inject each other's history.
+
 State lives in ``~/.claude/append_compactor_state.json`` (override with
 ``--state`` or ``APPEND_COMPACT_STATE``).
 
@@ -27,8 +32,11 @@ import inspect
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
+import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -39,7 +47,7 @@ except ImportError:  # pragma: no cover - Windows fallback
     fcntl = None  # type: ignore[assignment]
 
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 SCHEMA_VERSION = 1
 PLUGIN_NAME = "claude-append-compactor"
 
@@ -52,7 +60,7 @@ LLMLINGUA_MODEL = "microsoft/llmlingua-2-bert-base-multilingual-cased-meetingban
 # Compression results are content-addressed so parallel agents can share the
 # expensive LLMLingua work and receive byte-identical output for identical
 # input.  Bump the schema when the compression algorithm changes.
-COMPRESS_CACHE_SCHEMA = 1
+COMPRESS_CACHE_SCHEMA = 2
 COMPRESS_CACHE_MAX_FILES = 4_096
 
 # Claude Code caps each hook output string (additionalContext, systemMessage,
@@ -75,6 +83,20 @@ DEFAULT_PRECOMPACT_CHARS = 24_000
 MIN_PROSE_CHARS = 160
 L2_DIGEST_CHARS = 480
 ENTITY_HEADER_LIMIT = 200
+
+# Background compaction.  Hooks enqueue raw turns and return immediately; a
+# small, machine-wide pool of detached workers compresses them outside the hook
+# deadline.  Slots are global (not per session) so a swarm of parallel Claude
+# contexts cannot start one model process each.
+DEFAULT_WORKERS = 2
+DEFAULT_WORKER_IDLE_SECONDS = 120
+DEFAULT_WORKER_MAX_SECONDS = 900
+DEFAULT_CLAIM_TIMEOUT_SECONDS = 300
+DEFAULT_MAX_PENDING = 32
+DEFAULT_MAX_PENDING_TOTAL = 64
+DEFAULT_DRAIN_WAIT_SECONDS = 5
+PENDING_MAX_CHARS = 24_000
+PENDING_TEXT_HEADER = "raw"
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +270,7 @@ def new_state() -> dict[str, Any]:
         "created": _now(),
         "l1_chunks": [],
         "l2_masters": [],
+        "pending": [],
         "armed_sessions": {},
         "stats": {
             "turns": 0,
@@ -282,7 +305,7 @@ def load_state(path: Path | None = None) -> dict[str, Any]:
     base = new_state()
     for key, value in base.items():
         data.setdefault(key, value)
-    for key in ("l1_chunks", "l2_masters"):
+    for key in ("l1_chunks", "l2_masters", "pending"):
         if not isinstance(data.get(key), list):
             data[key] = []
     if not isinstance(data.get("armed_sessions"), dict):
@@ -297,26 +320,64 @@ def save_state(state: dict[str, Any], path: Path | None = None) -> None:
     _atomic_write_json(path, state)
 
 
-def active_l1(state: dict[str, Any]) -> list[dict[str, Any]]:
-    """L1 chunks not yet absorbed into an L2 master."""
+def _belongs(item: dict[str, Any], session: str | None) -> bool:
+    return session is None or item.get("session") == session
+
+
+def active_l1(state: dict[str, Any], session: str | None = None) -> list[dict[str, Any]]:
+    """L1 chunks not yet absorbed into an L2 master.
+
+    With ``session`` set, only that Claude context's chunks are returned, so
+    parallel sessions never see each other's turns.
+    """
     covered: set[int] = set()
     for master in state.get("l2_masters", []):
+        if not _belongs(master, session):
+            continue
         covered.update(int(n) for n in master.get("covered", []) if isinstance(n, int))
-    return [chunk for chunk in state.get("l1_chunks", []) if int(chunk.get("n", 0)) not in covered]
+    return [
+        chunk for chunk in state.get("l1_chunks", [])
+        if int(chunk.get("n", 0)) not in covered and _belongs(chunk, session)
+    ]
 
 
-def status_of(state: dict[str, Any], path: Path | None = None) -> dict[str, Any]:
-    active = active_l1(state)
+def status_of(
+    state: dict[str, Any],
+    path: Path | None = None,
+    session: str | None = None,
+) -> dict[str, Any]:
+    active = active_l1(state, session)
     stats = state.get("stats", {})
+    sessions: dict[str, dict[str, int]] = {}
+    for chunk in state.get("l1_chunks", []):
+        key = str(chunk.get("session") or "legacy")
+        entry = sessions.setdefault(key, {"chunks": 0, "active": 0})
+        entry["chunks"] += 1
+    for chunk in active:
+        key = str(chunk.get("session") or "legacy")
+        sessions.setdefault(key, {"chunks": 0, "active": 0})["active"] += 1
+    pending_by_session: dict[str, int] = {}
+    for job in state.get("pending", []):
+        key = str(job.get("session") or "legacy")
+        pending_by_session[key] = pending_by_session.get(key, 0) + 1
+    scoped_masters = [
+        master for master in state.get("l2_masters", []) if _belongs(master, session)
+    ]
     return {
         "plugin": PLUGIN_NAME,
         "version": VERSION,
         "state_file": str(path) if path else str(default_state_path()),
         "schema": state.get("schema"),
         "created": state.get("created"),
-        "l1_chunks": len(state.get("l1_chunks", [])),
+        "scope": session,
+        "l1_chunks": sum(
+            1 for chunk in state.get("l1_chunks", []) if _belongs(chunk, session)
+        ),
         "active_l1": [c.get("n") for c in active],
-        "l2_masters": len(state.get("l2_masters", [])),
+        "l2_masters": len(scoped_masters),
+        "pending": pending_count(state, session),
+        "pending_by_session": pending_by_session,
+        "sessions": sessions,
         "armed_sessions": sorted(state.get("armed_sessions", {})),
         "stats": stats,
         "last_event": state.get("last_event"),
@@ -464,10 +525,21 @@ _FILE_PATH_PATTERN = (
     r"|\b[\w@.+-]+\.(?:" + CODE_EXTENSIONS + r")\b"
 )
 
+_NUMERIC_LITERAL_PATTERN = (
+    # Decimals, versions and numbers with units.  LLMLingua preserves digits
+    # (force_reserve_digit) but can drop the punctuation that makes them one
+    # number ("7.592" -> "7 592"), so mask the whole literal and restore it
+    # byte-exact.  Bare integers are left to the compressor: masking every "3"
+    # costs more compression than it saves.
+    r"\b\d+(?:[.,]\d+)+(?:%|ns|µs|us|ms|s|KiB|MiB|GiB|TiB|KB|MB|GB|TB|PB)?(?![\w])"
+    r"|\b\d+(?:%|ns|µs|us|ms|s|KiB|MiB|GiB|TiB|KB|MB|GB|TB|PB)(?![\w])"
+)
+
 _MASKABLE_RE = re.compile(
     r"`[^`\n]+`"
     r"|https?://[^\s<>\"')\]]+"
     r"|" + _FILE_PATH_PATTERN +
+    r"|" + _NUMERIC_LITERAL_PATTERN +
     r"|\b[A-Za-z_$][\w$]*(?:_[A-Za-z0-9_$]+)+\b"
     r"|\b[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+\b"
     r"|\b[a-z][a-z0-9]*[A-Z][A-Za-z0-9]*\b"
@@ -1036,13 +1108,35 @@ def _digest(text: str, limit: int) -> str:
     return head + "\n…"
 
 
-def _build_master(state: dict[str, Any], batch: list[dict[str, Any]]) -> dict[str, Any]:
+def _chunk_range_label(numbers: list[int]) -> str:
+    """Render chunk numbers as exact ranges.
+
+    Sessions interleave chunk numbers, so a master may cover [1, 3, 5, 7, 8, 9].
+    Printing "#1–#9" would falsely imply the other sessions' chunks are included.
+    """
+    parts: list[str] = []
+    start = previous = numbers[0]
+    for number in numbers[1:]:
+        if number == previous + 1:
+            previous = number
+            continue
+        parts.append(f"#{start}–#{previous}" if start != previous else f"#{start}")
+        start = previous = number
+    parts.append(f"#{start}–#{previous}" if start != previous else f"#{start}")
+    return ", ".join(parts)
+
+
+def _build_master(
+    state: dict[str, Any],
+    batch: list[dict[str, Any]],
+    session: str | None = None,
+) -> dict[str, Any]:
     number = len(state.get("l2_masters", [])) + 1
     covered = [int(chunk["n"]) for chunk in batch]
     entities = _merge_entities(*[chunk.get("entities", []) for chunk in batch])
     lines = [
         f"### Consolidated Master Summary (L2) #{number}",
-        f"Covers Summary Chunks #{covered[0]}–#{covered[-1]}",
+        f"Covers Summary Chunks {_chunk_range_label(covered)}",
     ]
     lines.extend(_ledger_lines(entities))
     lines.append("**Chunk Digests:**")
@@ -1054,16 +1148,24 @@ def _build_master(state: dict[str, Any], batch: list[dict[str, Any]]) -> dict[st
         "created": _now(),
         "covered": covered,
         "entities": entities,
+        "session": session,
         "block": "\n".join(lines),
     }
 
 
-def consolidate_if_needed(state: dict[str, Any]) -> list[dict[str, Any]]:
-    """Consolidate active L1 chunks into immutable L2 masters at the threshold."""
+def consolidate_if_needed(
+    state: dict[str, Any],
+    session: str | None = None,
+) -> list[dict[str, Any]]:
+    """Consolidate active L1 chunks into immutable L2 masters at the threshold.
+
+    Consolidation is per session when ``session`` is given: six chunks from one
+    context form a master; chunks from another context are never mixed in.
+    """
     created: list[dict[str, Any]] = []
-    while len(active_l1(state)) >= L1_CONSOLIDATE_AT:
-        batch = active_l1(state)[:L1_CONSOLIDATE_AT]
-        master = _build_master(state, batch)
+    while len(active_l1(state, session)) >= L1_CONSOLIDATE_AT:
+        batch = active_l1(state, session)[:L1_CONSOLIDATE_AT]
+        master = _build_master(state, batch, session=session)
         state.setdefault("l2_masters", []).append(master)
         created.append(master)
     return created
@@ -1074,6 +1176,7 @@ def append_turn(
     text: str,
     source: str = "user_prompt",
     llm: Any = "auto",
+    session: str | None = None,
 ) -> dict[str, Any] | None:
     """Compress one turn and append it as an immutable L1 chunk."""
     if not text or not text.strip():
@@ -1082,12 +1185,14 @@ def append_turn(
     if not compressed.strip():
         return None
 
-    number = len(state.get("l1_chunks", [])) + 1
+    number = max((int(chunk.get("n", 0)) for chunk in state.get("l1_chunks", [])), default=0) + 1
     entities = _merge_entities(extract_entities(text), extract_entities(compressed))
     chunk = {
         "n": number,
         "created": _now(),
         "source": source,
+        "session": session,
+        "input_sha": hashlib.sha256(text.encode("utf-8")).hexdigest()[:32],
         "entities": entities,
         "compressed_text": compressed,
         "block": _chunk_block(number, entities, compressed, source),
@@ -1104,8 +1209,346 @@ def append_turn(
 
     # Keep every existing chunk dict byte-identical; the master records which
     # chunks it covers.  (Consolidation never rewrites a past chunk.)
-    consolidate_if_needed(state)
+    consolidate_if_needed(state, session)
     return chunk
+
+
+# ---------------------------------------------------------------------------
+# Background compaction queue
+# ---------------------------------------------------------------------------
+
+def _pending_for(state: dict[str, Any], session: str | None = None) -> list[dict[str, Any]]:
+    return [job for job in state.get("pending", []) if _belongs(job, session) and job.get("text")]
+
+
+def pending_count(state: dict[str, Any], session: str | None = None) -> int:
+    return len(_pending_for(state, session))
+
+
+def _already_captured(state: dict[str, Any], input_sha: str, session: str | None) -> bool:
+    for job in state.get("pending", []):
+        if _belongs(job, session) and job.get("source") == "precompact" and job.get("input_sha") == input_sha:
+            return True
+    for chunk in state.get("l1_chunks", []):
+        if _belongs(chunk, session) and chunk.get("source") == "precompact" and chunk.get("input_sha") == input_sha:
+            return True
+    return False
+
+
+def enqueue_turn(
+    state: dict[str, Any],
+    text: str,
+    source: str = "user_prompt",
+    session: str | None = None,
+    dedupe: bool = False,
+) -> dict[str, Any] | None:
+    """Queue a raw turn for a background worker; returns the (saved) job."""
+    if not text or not text.strip():
+        return None
+    input_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
+    if dedupe and _already_captured(state, input_sha, session):
+        return None
+    job = {
+        "id": uuid.uuid4().hex,
+        "session": session,
+        "source": source,
+        "created": _now(),
+        "created_at": time.time(),
+        "status": "pending",
+        "input_sha": input_sha,
+        "entities": extract_entities(text),
+        "text": text[:PENDING_MAX_CHARS],
+    }
+    state.setdefault("pending", []).append(job)
+    return job
+
+
+def queue_or_append(
+    state: dict[str, Any],
+    text: str,
+    source: str,
+    session: str | None,
+    background: bool,
+) -> dict[str, Any] | None:
+    """Enqueue for background compression, or compress inline as a fallback.
+
+    The inline fallback uses the deterministic pipeline only: when the queue is
+    full, blocking a hook on model work would make a busy swarm worse, not
+    better.  With background disabled the old synchronous behaviour is kept.
+    """
+    dedupe = source == "precompact"
+    if background and _env_bool("APPEND_COMPACT_LLM", True):
+        limit = _env_int("APPEND_COMPACT_MAX_PENDING", DEFAULT_MAX_PENDING)
+        total_limit = _env_int("APPEND_COMPACT_MAX_PENDING_TOTAL", DEFAULT_MAX_PENDING_TOTAL)
+        if pending_count(state, session) < limit and pending_count(state) < total_limit:
+            return enqueue_turn(state, text, source=source, session=session, dedupe=dedupe)
+        return append_turn(state, text, source=source, llm="off", session=session)
+    if dedupe and _already_captured(
+        state, hashlib.sha256(text.encode("utf-8")).hexdigest()[:32], session
+    ):
+        return None
+    return append_turn(state, text, source=source, session=session)
+
+
+def _requeue_stale(state: dict[str, Any], now: float) -> bool:
+    timeout = _env_int("APPEND_COMPACT_CLAIM_TIMEOUT", DEFAULT_CLAIM_TIMEOUT_SECONDS)
+    changed = False
+    for job in state.get("pending", []):
+        if job.get("status") != "working":
+            continue
+        claimed = job.get("claimed_at")
+        if not isinstance(claimed, (int, float)) or now - float(claimed) > timeout:
+            job["status"] = "pending"
+            job.pop("worker", None)
+            job.pop("claimed_at", None)
+            changed = True
+    return changed
+
+
+def claim_job(state: dict[str, Any], worker: str, now: float | None = None) -> tuple[dict[str, Any] | None, bool]:
+    """Claim the oldest job. Returns (job, state_changed).
+
+    PreCompact captures go first: after a compaction the next injection is
+    imminent, whereas prompt turns have until the next compaction.
+    """
+    now = time.time() if now is None else now
+    changed = _requeue_stale(state, now)
+    jobs = [job for job in state.get("pending", []) if job.get("status") == "pending" and job.get("text")]
+    jobs.sort(key=lambda job: (
+        0 if job.get("source") == "precompact" else 1,
+        float(job.get("created_at") or 0.0),
+        str(job.get("id")),
+    ))
+    if not jobs:
+        return None, changed
+    job = jobs[0]
+    job["status"] = "working"
+    job["worker"] = worker
+    job["claimed_at"] = now
+    return dict(job), True
+
+
+def commit_job(
+    state: dict[str, Any],
+    job_id: str,
+    compressed: str,
+    stats: dict[str, int],
+    worker: str | None = None,
+) -> dict[str, Any] | None:
+    """Turn a claimed job into an immutable chunk.
+
+    Re-reads happen in the caller under ``state_lock``.  A job that vanished
+    (materialised deterministically during a drain) or was claimed by someone
+    else is dropped without duplicating the turn.
+    """
+    entry = next((job for job in state.get("pending", []) if job.get("id") == job_id), None)
+    if entry is None:
+        return None
+    if worker is not None and entry.get("worker") != worker:
+        return None
+    if not compressed.strip():
+        return None
+    session = entry.get("session")
+    number = max((int(chunk.get("n", 0)) for chunk in state.get("l1_chunks", [])), default=0) + 1
+    entities = _merge_entities(extract_entities(entry.get("text", "")), extract_entities(compressed))
+    chunk = {
+        "n": number,
+        "created": _now(),
+        "source": entry.get("source", "user_prompt"),
+        "session": session,
+        "input_sha": entry.get("input_sha")
+        or hashlib.sha256(str(entry.get("text", "")).encode("utf-8")).hexdigest()[:32],
+        "entities": entities,
+        "compressed_text": compressed,
+        "block": _chunk_block(number, entities, compressed, entry.get("source", "")),
+        "stats": stats,
+    }
+    state.setdefault("l1_chunks", []).append(chunk)
+    state["pending"].remove(entry)
+
+    totals = state.setdefault("stats", {})
+    totals["turns"] = int(totals.get("turns", 0)) + 1
+    totals["bytes_in"] = int(totals.get("bytes_in", 0)) + int(stats.get("bytes_in", 0))
+    totals["bytes_out"] = int(totals.get("bytes_out", 0)) + int(stats.get("bytes_out", 0))
+    for key in ("llm_blocks", "fallback_blocks", "error_blocks"):
+        totals[key] = int(totals.get(key, 0)) + int(stats.get(key, 0))
+    consolidate_if_needed(state, session)
+    return chunk
+
+
+def materialize_pending(state: dict[str, Any], session: str | None = None) -> int:
+    """Deterministically commit queued turns (no model work, fast).
+
+    Used only when an injection deadline leaves work unfinished: a complete but
+    deterministic snapshot beats a missing recent turn.
+    """
+    jobs = [job for job in state.get("pending", []) if job.get("text") and _belongs(job, session)]
+    committed = 0
+    for job in jobs:
+        compressed, stats = compress_text(job["text"], llm="off")
+        if commit_job(state, str(job.get("id")), compressed, stats, worker=None) is not None:
+            committed += 1
+    return committed
+
+
+# ---------------------------------------------------------------------------
+# Detached worker pool
+# ---------------------------------------------------------------------------
+
+def _workers_dir() -> Path:
+    return default_cache_dir() / "workers"
+
+
+def _worker_idle_seconds() -> int:
+    return _env_int("APPEND_COMPACT_WORKER_IDLE", DEFAULT_WORKER_IDLE_SECONDS)
+
+
+def _acquire_worker_slot():
+    """Take one of the machine-wide worker slots, or return None."""
+    if fcntl is None:
+        return None
+    slots = _env_int("APPEND_COMPACT_WORKERS", DEFAULT_WORKERS)
+    root = _workers_dir()
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        for index in range(slots):
+            handle = (root / f"slot-{index}.lock").open("a+")
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (BlockingIOError, OSError):
+                handle.close()
+                continue
+            return handle
+    except OSError as exc:
+        _log_error(f"worker slots unavailable: {exc!r}")
+    return None
+
+
+def spawn_worker(state_path: Path) -> bool:
+    """Start one detached worker if a spawn is not already in flight."""
+    if fcntl is None or os.environ.get("APPEND_COMPACT_WORKER"):
+        return False
+    if not _env_bool("APPEND_COMPACT_BACKGROUND", True):
+        return False
+    root = _workers_dir()
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        gate = (root / "spawn.lock").open("a+")
+        try:
+            try:
+                fcntl.flock(gate.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (BlockingIOError, OSError):
+                return False
+            log = (root / "worker.log").open("a", encoding="utf-8")
+            try:
+                subprocess.Popen(
+                    [sys.executable, str(Path(__file__).resolve()), "--worker", "--state", str(state_path)],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=log,
+                    close_fds=True,
+                    start_new_session=(os.name == "posix"),
+                )
+            finally:
+                log.close()
+            return True
+        finally:
+            gate.close()  # closing releases the flock
+    except OSError as exc:
+        _log_error(f"cannot spawn compaction worker: {exc!r}")
+        return False
+
+
+def _heartbeat(worker: str, jobs: int, started: float, status: str) -> None:
+    path = _workers_dir() / f"{os.getpid()}.json"
+    try:
+        _atomic_write_json(path, {
+            "worker": worker,
+            "pid": os.getpid(),
+            "started": started,
+            "jobs": jobs,
+            "status": status,
+            "at": _now(),
+        })
+    except OSError:
+        pass
+
+
+def drain_session(state_path: Path, session: str, wait_seconds: int | None = None) -> int:
+    """Give workers a bounded window, then materialise what is left.
+
+    Called only right before an armed injection, so the extra latency is paid
+    at compaction boundaries rather than on every prompt.  Returns the number
+    of turns that had to be committed deterministically.
+    """
+    wait = _env_int("APPEND_COMPACT_DRAIN_WAIT", DEFAULT_DRAIN_WAIT_SECONDS) if wait_seconds is None else wait_seconds
+    spawn_worker(state_path)
+    deadline = time.monotonic() + max(0, wait)
+    while True:
+        with state_lock(state_path):
+            state = load_state(state_path)
+            remaining = pending_count(state, session)
+        if remaining == 0 or time.monotonic() >= deadline:
+            break
+        time.sleep(0.1)
+    if remaining == 0:
+        return 0
+    with state_lock(state_path):
+        state = load_state(state_path)
+        remaining = pending_count(state, session)
+        if remaining:
+            materialize_pending(state, session)
+        save_state(state, state_path)
+    return remaining
+
+
+def worker_main(state_path: Path) -> int:
+    """Compress queued turns until the queue is empty or the worker ages out."""
+    os.environ["APPEND_COMPACT_WORKER"] = "1"
+    slot = _acquire_worker_slot()
+    if slot is None:
+        return 0
+    try:
+        with contextlib.suppress(OSError, AttributeError):
+            os.nice(_env_int("APPEND_COMPACT_WORKER_NICE", 10))
+        # Torch reads these at import time; dividing the cores keeps two
+        # parallel workers from each spawning a full-size OpenMP pool.
+        slots = _env_int("APPEND_COMPACT_WORKERS", DEFAULT_WORKERS)
+        threads = max(1, (os.cpu_count() or slots) // max(1, slots))
+        os.environ.setdefault("OMP_NUM_THREADS", str(threads))
+        os.environ.setdefault("MKL_NUM_THREADS", str(threads))
+        worker = f"{os.getpid()}"
+        started = time.time()
+        deadline = started + _env_int("APPEND_COMPACT_WORKER_MAX_SECONDS", DEFAULT_WORKER_MAX_SECONDS)
+        last_job = time.time()
+        jobs_done = 0
+        _heartbeat(worker, jobs_done, started, "idle")
+        while time.time() < deadline:
+            job = None
+            with state_lock(state_path):
+                state = load_state(state_path)
+                job, changed = claim_job(state, worker)
+                if changed:
+                    save_state(state, state_path)
+            if job is None:
+                if time.time() - last_job >= _worker_idle_seconds():
+                    break
+                time.sleep(0.5)
+                continue
+            _heartbeat(worker, jobs_done, started, "working")
+            compressed, stats = compress_text(job["text"], llm="auto")
+            with state_lock(state_path):
+                state = load_state(state_path)
+                commit_job(state, str(job.get("id")), compressed, stats, worker=worker)
+                save_state(state, state_path)
+            jobs_done += 1
+            last_job = time.time()
+            _heartbeat(worker, jobs_done, started, "idle")
+        return 0
+    finally:
+        with contextlib.suppress(OSError):
+            (_workers_dir() / f"{os.getpid()}.json").unlink()
+        slot.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1163,20 +1606,20 @@ def _clamp_inject_chars(max_chars: int) -> int:
     return min(max_chars, ceiling)
 
 
-def _global_entities(state: dict[str, Any]) -> list[str]:
+def _global_entities(state: dict[str, Any], session: str | None = None) -> list[str]:
     return _merge_entities(
-        *[chunk.get("entities", []) for chunk in state.get("l1_chunks", [])],
-        *[master.get("entities", []) for master in state.get("l2_masters", [])],
+        *[chunk.get("entities", []) for chunk in state.get("l1_chunks", []) if _belongs(chunk, session)],
+        *[master.get("entities", []) for master in state.get("l2_masters", []) if _belongs(master, session)],
     )
 
 
-def _global_ledger_block(state: dict[str, Any], limit: int) -> str:
+def _global_ledger_block(state: dict[str, Any], limit: int, session: str | None = None) -> str:
     """Deterministic union of every pinned entity, kept at the stable head.
 
     Masters get dropped from the injection when the cap is tight, so this
     ledger is what keeps old file paths and symbol names alive.
     """
-    entities = _global_entities(state)
+    entities = _global_entities(state, session)
     if not entities or limit <= 0:
         return ""
     header = "**Entity Ledger (pinned):**"
@@ -1231,18 +1674,26 @@ def injection_payload(
     state: dict[str, Any],
     max_chars: int | None = None,
     event_name: str = "UserPromptSubmit",
+    session: str | None = None,
 ) -> dict[str, Any] | None:
-    """Bounded payload: pinned ledger head, newest L2 masters, newest active L1."""
+    """Bounded payload: pinned ledger head, newest L2 masters, newest active L1.
+
+    ``session`` isolates parallel Claude contexts: a context receives only the
+    chunks and masters captured under its own session id, never a peer's.
+    """
     max_chars = _clamp_inject_chars(
         max_chars or _env_int("APPEND_COMPACT_MAX_INJECT_CHARS", DEFAULT_MAX_INJECT_CHARS)
     )
-    masters = [master["block"] for master in state.get("l2_masters", []) if master.get("block")]
-    active = [chunk["block"] for chunk in active_l1(state) if chunk.get("block")]
+    masters = [
+        master["block"] for master in state.get("l2_masters", [])
+        if master.get("block") and _belongs(master, session)
+    ]
+    active = [chunk["block"] for chunk in active_l1(state, session) if chunk.get("block")]
     if not masters and not active:
         return None
 
     note = "\n\n[append-compactor: older context omitted to fit the 10k hook cap]"
-    ledger = _global_ledger_block(state, min(LEDGER_BUDGET_CHARS, max_chars // 4))
+    ledger = _global_ledger_block(state, min(LEDGER_BUDGET_CHARS, max_chars // 4), session)
     budget = max_chars - (len(ledger) + 2 if ledger else 0) - len(note)
 
     # Live turns outrank historical masters.
@@ -1293,11 +1744,12 @@ def injection_payload(
             "compactor": {
                 "plugin": PLUGIN_NAME,
                 "version": VERSION,
-                "l2_masters": len(state.get("l2_masters", [])),
+                "l2_masters": len(masters),
                 "active_l1": len(active),
+                "pending": pending_count(state, session),
                 "dropped_l2": dropped_masters,
                 "dropped_l1": dropped_active,
-                "pinned_entities": len(_global_entities(state)),
+                "pinned_entities": len(_global_entities(state, session)),
                 "max_inject_chars": max_chars,
             }
         },
@@ -1312,7 +1764,11 @@ def injection_payload(
 # Frozen shared block (multi-agent prefix reuse)
 # ---------------------------------------------------------------------------
 
-def shared_block_text(state: dict[str, Any], max_chars: int | None = None) -> str | None:
+def shared_block_text(
+    state: dict[str, Any],
+    max_chars: int | None = None,
+    session: str | None = None,
+) -> str | None:
     """Render the ledger and L2 masters as one byte-stable block, or ``None``.
 
     The block contains no timestamps, counters or session identifiers, so two
@@ -1320,12 +1776,15 @@ def shared_block_text(state: dict[str, Any], max_chars: int | None = None) -> st
     chunks are deliberately excluded: they are per-agent recency, and sharing
     them would put different bytes at different offsets.
     """
-    masters = [master["block"] for master in state.get("l2_masters", []) if master.get("block")]
+    masters = [
+        master["block"] for master in state.get("l2_masters", [])
+        if master.get("block") and _belongs(master, session)
+    ]
     if not masters:
         return None
     limit = max_chars or _env_int("APPEND_COMPACT_SHARED_CHARS", DEFAULT_MAX_INJECT_CHARS)
     limit = max(limit, len(SHARED_BLOCK_BANNER) + 200)
-    ledger = _global_ledger_block(state, min(LEDGER_BUDGET_CHARS, limit // 4))
+    ledger = _global_ledger_block(state, min(LEDGER_BUDGET_CHARS, limit // 4), session)
     budget = (
         limit
         - len(SHARED_BLOCK_BANNER)
@@ -1347,6 +1806,7 @@ def emit_shared_block(
     state: dict[str, Any],
     max_chars: int | None = None,
     cache_dir: Path | None = None,
+    session: str | None = None,
 ) -> dict[str, Any]:
     """Write the frozen block to ``<cache_dir>/shared/<sha256>.block``.
 
@@ -1355,7 +1815,7 @@ def emit_shared_block(
     file is never mutated in place, so a fan-out that already handed out a path
     keeps reading the same bytes.
     """
-    text = shared_block_text(state, max_chars=max_chars)
+    text = shared_block_text(state, max_chars=max_chars, session=session)
     if text is None:
         return {
             "emitted": False,
@@ -1364,7 +1824,7 @@ def emit_shared_block(
             "sha256": None,
             "chars": 0,
             "l2_masters": 0,
-            "pinned_entities": len(_global_entities(state)),
+            "pinned_entities": len(_global_entities(state, session)),
         }
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     path = (cache_dir or default_cache_dir()) / "shared" / f"{digest}.block"
@@ -1378,8 +1838,10 @@ def emit_shared_block(
         "shared_path": str(path),
         "sha256": digest,
         "chars": len(text),
-        "l2_masters": len(state.get("l2_masters", [])),
-        "pinned_entities": len(_global_entities(state)),
+        "l2_masters": sum(
+            1 for master in state.get("l2_masters", []) if _belongs(master, session)
+        ),
+        "pinned_entities": len(_global_entities(state, session)),
     }
 
 
@@ -1536,16 +1998,20 @@ def _read_transcript_turns(path: str | None, max_turns: int, max_chars: int) -> 
 PRECOMPACT_INSTRUCTION_CAP = 4_000
 
 
-def _preservation_instructions(state: dict[str, Any]) -> str:
+def _preservation_instructions(state: dict[str, Any], session: str | None = None) -> str:
     """Plain text appended to Claude Code's compaction instructions.
 
     Claude Code ignores hookSpecificOutput on PreCompact; plain stdout from a
     successful hook is appended to the compaction prompt.  Keep this a str and
-    well under the 10,000-character hook-output ceiling.
+    well under the 10,000-character hook-output ceiling.  Queued turns are
+    included so an entity captured seconds ago is never lost just because its
+    background compression has not finished.
     """
+    masters = [master for master in state.get("l2_masters", []) if _belongs(master, session)]
     entities = _merge_entities(
-        *[chunk.get("entities", []) for chunk in active_l1(state)],
-        *[master.get("entities", []) for master in state.get("l2_masters", [])[-1:]],
+        *[chunk.get("entities", []) for chunk in active_l1(state, session)],
+        *[master.get("entities", []) for master in masters[-1:]],
+        *[job.get("entities", []) for job in _pending_for(state, session)],
     )[:ENTITY_HEADER_LIMIT]
     prefix = "Entity Ledger (preserve these file paths and exported symbol names verbatim"
     if entities:
@@ -1566,6 +2032,8 @@ def handle_prompt_event(
     state: dict[str, Any],
     payload: dict[str, Any],
     args: argparse.Namespace,
+    *,
+    background: bool = False,
 ) -> dict[str, Any] | None:
     session = str(payload.get("session_id") or "default")
     prompt = args.prompt if args.prompt is not None else payload.get("prompt")
@@ -1576,10 +2044,11 @@ def handle_prompt_event(
     output = None
     if args.force_inject or armed:
         # Build context from history *before* appending the current prompt, so
-        # the prompt is never duplicated back to the model.
-        output = injection_payload(state)
+        # the prompt is never duplicated back to the model.  Only this
+        # session's chunks are eligible.
+        output = injection_payload(state, session=session)
 
-    append_turn(state, prompt, source="user_prompt")
+    queue_or_append(state, prompt, "user_prompt", session, background)
 
     if armed:
         state.get("armed_sessions", {}).pop(session, None)
@@ -1591,6 +2060,8 @@ def handle_sessionstart_event(
     state: dict[str, Any],
     payload: dict[str, Any],
     args: argparse.Namespace,
+    *,
+    background: bool = False,
 ) -> dict[str, Any] | None:
     """Inject armed context at SessionStart(matcher=compact).
 
@@ -1602,7 +2073,7 @@ def handle_sessionstart_event(
     armed = bool(state.get("armed_sessions", {}).get(session))
     output = None
     if args.force_inject or armed:
-        output = injection_payload(state, event_name="SessionStart")
+        output = injection_payload(state, event_name="SessionStart", session=session)
     if armed:
         state.get("armed_sessions", {}).pop(session, None)
     state["last_event"] = {
@@ -1618,6 +2089,8 @@ def handle_precompact_event(
     state: dict[str, Any],
     payload: dict[str, Any],
     args: argparse.Namespace,
+    *,
+    background: bool = False,
 ) -> str:
     """Capture the transcript, arm the session, return plain-text instructions.
 
@@ -1630,7 +2103,7 @@ def handle_precompact_event(
     max_chars = _env_int("APPEND_COMPACT_PRECOMPACT_CHARS", DEFAULT_PRECOMPACT_CHARS)
     turns = _read_transcript_turns(payload.get("transcript_path"), max_turns, max_chars)
     for role, text in turns:
-        append_turn(state, f"{role.capitalize()}:\n{text}", source="precompact")
+        queue_or_append(state, f"{role.capitalize()}:\n{text}", "precompact", session, background)
 
     state.setdefault("armed_sessions", {})[session] = {
         "armed": True,
@@ -1639,7 +2112,7 @@ def handle_precompact_event(
         "captured_turns": len(turns),
     }
     state["last_event"] = {"event": "PreCompact", "session_id": session, "at": _now()}
-    return _preservation_instructions(state)
+    return _preservation_instructions(state, session)
 
 
 # ---------------------------------------------------------------------------
@@ -1727,6 +2200,46 @@ def self_test(verbose: bool = False) -> bool:
         "(×30)" in condensed and "src/app.py:0: failure" in condensed and len(condensed) < len(noisy),
     )
     check("known-negative: short clean tool output unchanged", condense_tool_output("ok\n") == "ok")
+
+    queue_probe = new_state()
+    queued = enqueue_turn(queue_probe, "queued src/queued.py buildThing", session="A")
+    claimed, _ = claim_job(queue_probe, "selftest")
+    second_claim, _ = claim_job(queue_probe, "selftest-2")
+    queued_text, queued_stats = compress_text(claimed["text"], llm="off") if claimed else ("", {})
+    committed = commit_job(
+        queue_probe, str(queued.get("id")), queued_text, queued_stats, worker="selftest"
+    ) if claimed else None
+    check(
+        "known-positive: queue claim/commit yields exactly one chunk",
+        committed is not None
+        and pending_count(queue_probe) == 0
+        and len(queue_probe["l1_chunks"]) == 1,
+    )
+    check("known-negative: a claimed job is not claimable twice", second_claim is None)
+
+    scoped = new_state()
+    append_turn(scoped, "alpha context src/alpha.py", llm="off", session="A")
+    append_turn(scoped, "beta context src/beta.py", llm="off", session="B")
+    injection_a = injection_payload(scoped, session="A")
+    injection_b = injection_payload(scoped, session="B")
+    check(
+        "known-positive: parallel sessions are isolated",
+        injection_a is not None
+        and injection_b is not None
+        and "src/alpha.py" in injection_a["additional_context"]
+        and "src/beta.py" not in injection_a["additional_context"]
+        and "src/beta.py" in injection_b["additional_context"],
+    )
+
+    drained = new_state()
+    enqueue_turn(drained, "drain src/drained.py", session="A")
+    drained_count = materialize_pending(drained, "A")
+    check(
+        "known-positive: drain materialises deterministically",
+        drained_count == 1
+        and pending_count(drained) == 0
+        and drained["l1_chunks"][0]["stats"]["llm_blocks"] == 0,
+    )
 
     shared_first = shared_block_text(probe)
     check(
@@ -1849,6 +2362,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="freeze ledger + L2 masters into a byte-stable file for multi-agent prefix reuse",
     )
     parser.add_argument("--shared-max-chars", type=int, help="cap for the emitted shared block")
+    parser.add_argument("--scope", help="session id to report or share (default: all)")
+    parser.add_argument(
+        "--no-background",
+        action="store_true",
+        help="compress synchronously instead of queueing for a worker",
+    )
+    parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--no-llm", action="store_true", help="disable LLMLingua for this invocation")
     parser.add_argument("--self-test", action="store_true", help="run known-positive/negative controls")
     parser.add_argument("--version", action="store_true")
@@ -1871,19 +2391,27 @@ def main(argv: list[str] | None = None) -> int:
         _log_error(f"cannot resolve state path: {exc!r}")
         return 0
 
+    if args.worker:
+        try:
+            return worker_main(state_path)
+        except Exception as exc:  # never leave a traceback for the host
+            _log_error(f"worker failure: {exc!r}")
+            return 0
     if args.reset:
         with state_lock(state_path):
             save_state(new_state(), state_path)
         print(json.dumps({"reset": True, "state": str(state_path)}))
         return 0
     if args.status:
-        state = load_state(state_path)
-        print(json.dumps(status_of(state, state_path), indent=2, ensure_ascii=False))
+        with state_lock(state_path):
+            state = load_state(state_path)
+        print(json.dumps(status_of(state, state_path, args.scope), indent=2, ensure_ascii=False))
         return 0
     if args.emit_shared_block:
-        state = load_state(state_path)
+        with state_lock(state_path):
+            state = load_state(state_path)
         try:
-            result = emit_shared_block(state, max_chars=args.shared_max_chars)
+            result = emit_shared_block(state, max_chars=args.shared_max_chars, session=args.scope)
         except OSError as exc:
             print(json.dumps({"emitted": False, "reason": f"write failed: {exc}"}, ensure_ascii=False))
             return 1
@@ -1911,24 +2439,49 @@ def main(argv: list[str] | None = None) -> int:
     elif event == "prompt" and args.prompt is None:
         payload = _read_stdin_payload()
 
+    # Without fcntl there is no cross-process lock, so a worker pool cannot be
+    # safe; keep the synchronous path on those platforms.
+    args.background = (
+        _env_bool("APPEND_COMPACT_BACKGROUND", True)
+        and not args.no_background
+        and fcntl is not None
+    )
+    session = str(payload.get("session_id") or "default")
+
+    # An armed injection is imminent.  Give background workers one short,
+    # bounded window, then commit whatever is left deterministically so the
+    # injected context is complete and the hook stays far inside its deadline.
+    if args.background and event in ("prompt", "sessionstart"):
+        try:
+            with state_lock(state_path):
+                probe = load_state(state_path)
+            armed = bool(probe.get("armed_sessions", {}).get(session))
+            if (armed or args.force_inject) and pending_count(probe, session) > 0:
+                drain_session(state_path, session)
+        except Exception as exc:
+            _log_error(f"background drain failed: {exc!r}")
+
     output: Any = None
     try:
         with state_lock(state_path):
             state = load_state(state_path)
             if event == "precompact":
-                output = handle_precompact_event(state, payload, args)
+                output = handle_precompact_event(state, payload, args, background=args.background)
             elif event == "sessionstart":
-                output = handle_sessionstart_event(state, payload, args)
+                output = handle_sessionstart_event(state, payload, args, background=args.background)
             elif event == "prompt":
-                output = handle_prompt_event(state, payload, args)
+                output = handle_prompt_event(state, payload, args, background=args.background)
             elif args.inject or args.force_inject:
-                output = injection_payload(state)
+                output = injection_payload(state, session=args.scope)
             else:
-                output = status_of(state, state_path)
+                output = status_of(state, state_path, args.scope)
             save_state(state, state_path)
     except Exception as exc:  # hooks must never break the host session
         _log_error(f"hook failure: {exc!r}")
         return 0
+
+    if args.background and event in ("precompact", "prompt", "sessionstart") and state.get("pending"):
+        spawn_worker(state_path)
 
     if isinstance(output, str):
         # PreCompact: raw stdout is appended to the compaction instructions.

@@ -50,6 +50,10 @@ def isolated_environment(tmp_path, monkeypatch):
     """Keep logs and compressor globals test-local."""
     monkeypatch.setenv("APPEND_COMPACT_LOG", str(tmp_path / "error.log"))
     monkeypatch.setenv("APPEND_COMPACT_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("APPEND_COMPACT_BACKGROUND", "0")
+    monkeypatch.delenv("APPEND_COMPACT_WORKER", raising=False)
+    monkeypatch.delenv("APPEND_COMPACT_WORKERS", raising=False)
+    monkeypatch.delenv("APPEND_COMPACT_DRAIN_WAIT", raising=False)
     monkeypatch.delenv("APPEND_COMPACT_LLM", raising=False)
     monkeypatch.delenv("APPEND_COMPACT_CACHE", raising=False)
     monkeypatch.delenv("OPENROUTER_EXTRA_HEADERS", raising=False)
@@ -62,8 +66,8 @@ def _fresh_state() -> dict:
     return compactor.new_state()
 
 
-def _append(state: dict, text: str, source: str = "user_prompt") -> dict:
-    chunk = compactor.append_turn(state, text, source=source, llm="off")
+def _append(state: dict, text: str, source: str = "user_prompt", session: str | None = None) -> dict:
+    chunk = compactor.append_turn(state, text, source=source, llm="off", session=session)
     assert chunk is not None
     return chunk
 
@@ -215,6 +219,40 @@ def test_working_callable_preserves_and_restores_entities():
     assert set(compactor.extract_entities(text)) == set(compactor.extract_entities(LONG_PROSE))
 
 
+def test_prose_compression_keeps_decimals_and_percentages():
+    text = (
+        "We should carefully inspect src/app.ts before changing buildThing, because "
+        "the p99 latency is 7.592s at 99% of requests and the current implementation "
+        "repeats several expensive checks on every request in the hot path.\n\n"
+        "The team agreed to document each step so future readers can reproduce the result."
+    )
+
+    def fake(masked, rate, force_tokens):
+        assert "7.592" not in masked and "99%" not in masked
+        return re.sub(r"\b(carefully|several|expensive) ", "", masked)
+
+    output, mode = compactor.compress_prose(text, llm=fake)
+    assert mode == "llmlingua"
+    assert "7.592s" in output and "99%" in output
+    assert len(output) < len(compactor._normalize_prose(text))
+
+
+def test_numeric_literals_are_masked_and_restored_exactly():
+    text = (
+        "The batch takes 7.592s at 99% and uses 42ms on 3 nodes; "
+        "version 2.15.0 fits in 512MB."
+    )
+    masked, placeholders, mapping = compactor._mask_entities(text)
+    for literal in ("7.592s", "99%", "42ms", "2.15.0", "512MB"):
+        assert literal not in masked
+    # Bare integers stay with the compressor; masking every digit is not worth
+    # the compression it costs.
+    assert "3 nodes" in masked
+    assert compactor._restore_entities(masked, mapping) == text
+    restored_literals = {mapping[placeholder] for placeholder in placeholders}
+    assert {"7.592s", "99%", "42ms", "2.15.0", "512MB"} <= restored_literals
+
+
 def test_error_paragraphs_are_never_compressed():
     calls = []
 
@@ -328,6 +366,7 @@ def test_l2_consolidation_triggers_exactly_at_six():
     assert master["covered"] == [1, 2, 3, 4, 5, 6]
     assert "Consolidated Master Summary (L2) #1" in master["block"]
     assert master["block"].startswith("### Consolidated Master Summary (L2) #1")
+    assert "Covers Summary Chunks #1–#6" in master["block"]
     assert compactor.active_l1(state) == []
 
     # Past chunk blocks and dicts are byte-identical after consolidation.
@@ -357,10 +396,10 @@ def test_l2_handles_multiple_batches_in_a_loop():
 # Injection payload
 # ---------------------------------------------------------------------------
 
-def _state_with_master_and_active() -> dict:
+def _state_with_master_and_active(session: str | None = None) -> dict:
     state = _fresh_state()
     for index in range(7):
-        _append(state, f"turn {index} touches src/module_{index}.py")
+        _append(state, f"turn {index} touches src/module_{index}.py", session=session)
     assert len(state["l2_masters"]) == 1
     assert [c["n"] for c in compactor.active_l1(state)] == [7]
     return state
@@ -640,7 +679,7 @@ def test_transcript_tool_results_are_captured_and_condensed(tmp_path):
 
 
 def test_sessionstart_injects_armed_session_once_and_disarms():
-    state = _state_with_master_and_active()
+    state = _state_with_master_and_active(session="s1")
     state.setdefault("armed_sessions", {})["s1"] = {"armed": True}
     args = Namespace(force_inject=False, inject=True)
 
@@ -820,3 +859,262 @@ def test_cli_emit_shared_block_prints_path_and_hash(tmp_path):
     assert payload["emitted"] is True
     assert payload["l2_masters"] == 1
     assert Path(payload["shared_path"]).exists()
+
+
+# ---------------------------------------------------------------------------
+# Parallel contexts, background queue, and detached workers
+# ---------------------------------------------------------------------------
+
+def test_sessions_never_share_injected_context():
+    state = _fresh_state()
+    _append(state, "alpha context touches src/alpha.ts", session="A")
+    _append(state, "beta context touches src/beta.ts", session="B")
+
+    alpha = compactor.injection_payload(state, session="A")
+    beta = compactor.injection_payload(state, session="B")
+    assert alpha is not None and beta is not None
+    assert "src/alpha.ts" in alpha["additional_context"]
+    assert "src/beta.ts" not in alpha["additional_context"]
+    assert "src/beta.ts" in beta["additional_context"]
+    assert "src/alpha.ts" not in beta["additional_context"]
+    assert alpha["metadata"]["compactor"]["pending"] == 0
+
+
+def test_consolidation_is_per_session():
+    state = _fresh_state()
+    for index in range(3):
+        _append(state, f"A turn {index} touches src/a_{index}.py", session="A")
+        _append(state, f"B turn {index} touches src/b_{index}.py", session="B")
+    assert state["l2_masters"] == []
+
+    for index in range(3, 6):
+        _append(state, f"A turn {index} touches src/a_{index}.py", session="A")
+
+    assert len(state["l2_masters"]) == 1
+    master = state["l2_masters"][0]
+    assert master["session"] == "A"
+    assert master["covered"] == [1, 3, 5, 7, 8, 9]
+    # Interleaved sessions must not be described as a continuous #1–#9 range.
+    assert "Covers Summary Chunks #1, #3, #5, #7–#9" in master["block"]
+    assert "src/a_0.py" in master["block"]
+    assert "src/b_0.py" not in master["block"]
+    assert [chunk["n"] for chunk in compactor.active_l1(state, "B")] == [2, 4, 6]
+
+
+def test_queue_claim_commit_round_trip():
+    state = _fresh_state()
+    job = compactor.enqueue_turn(state, "queued src/queued.py buildThing", session="s")
+    assert job is not None
+    assert compactor.pending_count(state, "s") == 1
+    assert compactor.pending_count(state, "other") == 0
+    assert compactor.injection_payload(state, session="s") is None
+
+    claimed, changed = compactor.claim_job(state, "worker-1")
+    assert claimed is not None and changed is True
+    assert claimed["id"] == job["id"]
+    assert state["pending"][0]["status"] == "working"
+
+    compressed, stats = compactor.compress_text(claimed["text"], llm="off")
+    chunk = compactor.commit_job(state, claimed["id"], compressed, stats, worker="worker-1")
+    assert chunk is not None
+    assert chunk["session"] == "s"
+    assert chunk["n"] == 1
+    assert compactor.pending_count(state, "s") == 0
+    payload = compactor.injection_payload(state, session="s")
+    assert payload is not None and "src/queued.py" in payload["additional_context"]
+
+
+def test_claim_is_exclusive_and_stale_claims_are_reclaimed():
+    state = _fresh_state()
+    compactor.enqueue_turn(state, "one src/one.py", session="s")
+    first, _ = compactor.claim_job(state, "worker-1")
+    assert first is not None
+    second, changed = compactor.claim_job(state, "worker-2")
+    assert second is None and changed is False
+
+    timeout = compactor._env_int(
+        "APPEND_COMPACT_CLAIM_TIMEOUT", compactor.DEFAULT_CLAIM_TIMEOUT_SECONDS
+    )
+    reclaimed, changed = compactor.claim_job(
+        state, "worker-2", now=first["claimed_at"] + timeout + 1
+    )
+    assert reclaimed is not None and changed is True
+    assert state["pending"][0]["worker"] == "worker-2"
+
+
+def test_commit_from_a_superseded_claim_is_rejected():
+    state = _fresh_state()
+    compactor.enqueue_turn(state, "work src/work.py", session="s")
+    first, _ = compactor.claim_job(state, "worker-1")
+    compactor._requeue_stale(state, now=first["claimed_at"] + 10_000)
+    second, _ = compactor.claim_job(state, "worker-2")
+    assert second is not None
+
+    compressed = "work src/work.py"
+    stats = {"bytes_in": 18, "bytes_out": 18}
+    assert compactor.commit_job(state, first["id"], compressed, stats, worker="worker-1") is None
+    assert compactor.commit_job(state, second["id"], compressed, stats, worker="worker-2") is not None
+    assert len(state["l1_chunks"]) == 1
+
+
+def test_materialize_pending_commits_deterministically():
+    state = _fresh_state()
+    compactor.enqueue_turn(state, LONG_PROSE, session="s")
+    before = compactor.pending_count(state, "s")
+    assert before == 1
+
+    committed = compactor.materialize_pending(state, "s")
+    assert committed == 1
+    assert compactor.pending_count(state, "s") == 0
+    chunk = state["l1_chunks"][0]
+    assert chunk["session"] == "s"
+    assert chunk["stats"]["llm_blocks"] == 0  # no model work on the drain path
+    assert "src/app.ts" in chunk["compressed_text"]
+
+
+def test_preservation_instructions_include_queued_entities():
+    state = _fresh_state()
+    compactor.enqueue_turn(
+        state, "Please fix src/pending.ts and export function pendingThing() {}", session="s"
+    )
+    text = compactor._preservation_instructions(state, "s")
+    assert "src/pending.ts" in text and "pendingThing" in text
+
+    other = compactor._preservation_instructions(state, "other")
+    assert "src/pending.ts" not in other
+
+
+def test_background_prompt_enqueues_and_arms_nothing():
+    state = _fresh_state()
+    state.setdefault("armed_sessions", {})["s"] = {"armed": True}
+    args = Namespace(force_inject=False, inject=True, prompt=None)
+    output = compactor.handle_prompt_event(
+        state,
+        {"session_id": "s", "prompt": "next prompt touches src/next.py"},
+        args,
+        background=True,
+    )
+    # Nothing was ready to inject, and the current prompt is queued, not chunked.
+    assert output is None
+    assert state["l1_chunks"] == []
+    assert compactor.pending_count(state, "s") == 1
+    assert state["pending"][0]["source"] == "user_prompt"
+    assert "s" not in state["armed_sessions"]
+
+
+def test_max_pending_falls_back_to_deterministic_append(monkeypatch):
+    monkeypatch.setenv("APPEND_COMPACT_MAX_PENDING", "1")
+    state = _fresh_state()
+    compactor.queue_or_append(state, "first src/first.py", "user_prompt", "s", background=True)
+    assert compactor.pending_count(state, "s") == 1
+
+    compactor.queue_or_append(state, "second src/second.py", "user_prompt", "s", background=True)
+    assert compactor.pending_count(state, "s") == 1
+    assert len(state["l1_chunks"]) == 1
+    assert "src/second.py" in state["l1_chunks"][0]["compressed_text"]
+
+
+def test_total_pending_cap_bounds_the_shared_state(monkeypatch):
+    monkeypatch.setenv("APPEND_COMPACT_MAX_PENDING_TOTAL", "2")
+    state = _fresh_state()
+    for session in ("a", "b"):
+        compactor.queue_or_append(state, f"{session} queued", "user_prompt", session, background=True)
+    assert compactor.pending_count(state) == 2
+
+    # A third session is over the machine-wide cap: its turn is still captured,
+    # but deterministically and without growing the queue.
+    compactor.queue_or_append(state, "c overflow src/c.py", "user_prompt", "c", background=True)
+    assert compactor.pending_count(state) == 2
+    assert len(state["l1_chunks"]) == 1
+    assert state["l1_chunks"][0]["session"] == "c"
+
+
+def test_emit_shared_block_can_be_scoped():
+    state = _fresh_state()
+    for index in range(6):
+        _append(state, f"A turn {index} touches src/a_{index}.py", session="A")
+        _append(state, f"B turn {index} touches src/b_{index}.py", session="B")
+
+    a_text = compactor.shared_block_text(state, session="A")
+    b_text = compactor.shared_block_text(state, session="B")
+    assert a_text is not None and b_text is not None
+    assert "src/a_0.py" in a_text and "src/b_0.py" not in a_text
+    assert "src/b_0.py" in b_text and "src/a_0.py" not in b_text
+
+
+def test_drain_session_materializes_after_the_deadline(tmp_path, monkeypatch):
+    state_path = tmp_path / "state.json"
+    state = _fresh_state()
+    compactor.enqueue_turn(state, "drain me src/drain.py", session="s")
+    compactor.enqueue_turn(state, "other scope src/other.py", session="other")
+    compactor.save_state(state, state_path)
+
+    remaining = compactor.drain_session(state_path, "s", wait_seconds=0)
+    assert remaining == 1
+    reloaded = compactor.load_state(state_path)
+    assert compactor.pending_count(reloaded, "s") == 0
+    assert compactor.pending_count(reloaded, "other") == 1
+    assert any(chunk.get("session") == "s" for chunk in reloaded["l1_chunks"])
+
+
+def test_spawn_worker_respects_background_off_and_worker_env(tmp_path, monkeypatch):
+    state_path = tmp_path / "state.json"
+    compactor.save_state(_fresh_state(), state_path)
+    assert compactor.spawn_worker(state_path) is False  # fixture disables background
+
+    monkeypatch.setenv("APPEND_COMPACT_BACKGROUND", "1")
+    monkeypatch.setenv("APPEND_COMPACT_WORKER", "1")
+    assert compactor.spawn_worker(state_path) is False  # a worker never spawns another
+
+    monkeypatch.delenv("APPEND_COMPACT_WORKER")
+    calls = []
+
+    class FakePopen:
+        def __init__(self, argv, **kwargs):
+            calls.append((argv, kwargs))
+
+    monkeypatch.setattr(compactor.subprocess, "Popen", FakePopen)
+    assert compactor.spawn_worker(state_path) is True
+    assert calls and calls[0][0][-3:] == ["--worker", "--state", str(state_path)]
+    assert calls[0][1]["start_new_session"] is True
+
+
+def test_worker_slots_are_machine_wide(tmp_path, monkeypatch):
+    monkeypatch.setenv("APPEND_COMPACT_WORKERS", "1")
+    first = compactor._acquire_worker_slot()
+    assert first is not None
+    try:
+        assert compactor._acquire_worker_slot() is None
+    finally:
+        first.close()
+    third = compactor._acquire_worker_slot()
+    assert third is not None
+    third.close()
+
+
+def test_precompact_capture_is_deduplicated_across_events(tmp_path):
+    transcript = tmp_path / "transcript.jsonl"
+    _write_transcript(transcript)
+    state = _fresh_state()
+    payload = {"session_id": "s", "transcript_path": str(transcript)}
+    args = Namespace()
+
+    compactor.handle_precompact_event(state, payload, args)
+    first = len(state["l1_chunks"])
+    assert first == 2
+    compactor.handle_precompact_event(state, payload, args)
+    assert len(state["l1_chunks"]) == first
+
+
+def test_precompact_dedupes_queued_turns(tmp_path, monkeypatch):
+    monkeypatch.setenv("APPEND_COMPACT_BACKGROUND", "1")
+    transcript = tmp_path / "transcript.jsonl"
+    _write_transcript(transcript)
+    state = _fresh_state()
+    payload = {"session_id": "s", "transcript_path": str(transcript)}
+    args = Namespace()
+
+    compactor.handle_precompact_event(state, payload, args, background=True)
+    assert compactor.pending_count(state, "s") == 2
+    compactor.handle_precompact_event(state, payload, args, background=True)
+    assert compactor.pending_count(state, "s") == 2

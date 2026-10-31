@@ -1,7 +1,7 @@
 {
   "name": "claude-append-compactor",
-  "version": "1.4.0",
-  "description": "Multilevel append-only compactor with llmlingua-2, line-level code minification, and entity pinning for Claude Code",
+  "version": "1.5.0",
+  "description": "Multilevel append-only compactor with background session-isolated compression, LLMLingua-2, line-level code minification, and entity pinning for Claude Code",
   "author": {
     "name": "claude-append-compactor contributors"
   },

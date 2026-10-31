@@ -34,7 +34,10 @@ record and re-injects it as additional context, so:
   entity ledger at its head;
 - tool output is captured too, condensed to head/tail lines, collapsed
   repetition and diagnostic lines, so large command results do not vanish
-  without their errors.
+  without their errors;
+- compression runs in detached background workers by default, so hooks stay
+  fast, and every chunk is session-tagged, so parallel contexts and agent
+  swarms sharing one install never see each other's history.
 
 ---
 
@@ -47,23 +50,28 @@ SessionStart      ├─► injection_payload() ──► hookSpecificOutput.add
                   │        ├─ pinned entity ledger    own wall is 10k per string)
                   │        │  (stable head, 2k)
                   │        ├─ newest L2 masters
-                  │        └─ newest active L1
+                  │        └─ newest active L1, this session only
                   │
 PreCompact ───────┘  read transcript JSONL (last N turns + condensed tool results)
         │
-        ├─► compression pipeline
-        │     fenced code → python-minifier / line-level / JSON
-        │     prose       → selective LLMLingua-2 with entity masks
-        │     ledger      → regex paths + exported/top-level symbols
-        ├─► append immutable L1 chunk; every 6 L1 → immutable L2 master
+        ├─► enqueue raw turns (background mode, the default)
+        │     └─► detached worker process, machine-wide slot pool
+        │           compression pipeline, outside the state lock
+        │             fenced code → python-minifier / line-level / JSON
+        │             prose       → selective LLMLingua-2 with entity masks
+        │             ledger      → regex paths + exported/top-level symbols
+        │           commit under the lock → immutable L1 chunk;
+        │           every 6 L1 of that session → immutable L2 master
         ├─► arm session
         └─► print plain-text Entity Ledger preservation instructions to stdout
 ```
 
 The same state is read by all three hooks; PreCompact arms, and whichever of
 `SessionStart(compact)` or the next `UserPromptSubmit` runs first consumes the
-arm. The injected view is bounded and recency-prioritised; the stored L1/L2
-blocks are never rewritten.
+arm. Every chunk, master and queued job carries its `session_id`; injection
+filters to the calling session, so parallel Claude Code contexts sharing this
+plugin never see each other's turns. The injected view is bounded and
+recency-prioritised; the stored L1/L2 blocks are never rewritten.
 
 ---
 
@@ -143,9 +151,9 @@ python3 -m pip install --user --break-system-packages -r requirements.txt
 
 | Hook | Command | Reads | Writes | Output |
 | --- | --- | --- | --- | --- |
-| `PreCompact` | `append-compact.py --event precompact` | `transcript_path` JSONL, last `APPEND_COMPACT_PRECOMPACT_TURNS` text turns, capped at `APPEND_COMPACT_PRECOMPACT_CHARS`, plus condensed `tool_result` / `toolUseResult` output (6k chars total) | Appends each turn as an L1 chunk (`source: precompact`), consolidates if needed, arms the session | **Plain text** on stdout. Current Claude Code versions append successful PreCompact stdout to their compaction instructions; treat that as best-effort, not a documented injection channel. |
-| `SessionStart` (matcher `compact`) | `append-compact.py --event sessionstart --inject` | Hook JSON on stdin (`session_id`, `source`) | If armed: injects once at the documented post-compaction point and disarms | JSON: `hookSpecificOutput.additionalContext` with `hookEventName: "SessionStart"` |
-| `UserPromptSubmit` | `append-compact.py --event prompt --inject` | Hook JSON on stdin (`session_id`, `prompt`) | If still armed (SessionStart did not fire): builds injection from history **before** appending the prompt; always appends the prompt as an L1 chunk (`source: user_prompt`); disarms | JSON: `hookSpecificOutput.additionalContext` (functional in Claude Code), plus `additional_context`, `content_blocks` and `metadata` for custom routers |
+| `PreCompact` | `append-compact.py --event precompact` | `transcript_path` JSONL, last `APPEND_COMPACT_PRECOMPACT_TURNS` text turns, capped at `APPEND_COMPACT_PRECOMPACT_CHARS`, plus condensed `tool_result` / `toolUseResult` output (6k chars total) | Queues each turn for background compression (`source: precompact`, deduped by input hash), falls back to an immediate deterministic L1 chunk if the queue is full, arms the session | **Plain text** on stdout. Current Claude Code versions append successful PreCompact stdout to their compaction instructions; treat that as best-effort, not a documented injection channel. |
+| `SessionStart` (matcher `compact`) | `append-compact.py --event sessionstart --inject` | Hook JSON on stdin (`session_id`, `source`) | If armed: drains this session's queue within `APPEND_COMPACT_DRAIN_WAIT`, injects once at the documented post-compaction point and disarms | JSON: `hookSpecificOutput.additionalContext` with `hookEventName: "SessionStart"` |
+| `UserPromptSubmit` | `append-compact.py --event prompt --inject` | Hook JSON on stdin (`session_id`, `prompt`) | If still armed (SessionStart did not fire): drains this session's queue within `APPEND_COMPACT_DRAIN_WAIT`, then builds injection from history **before** enqueuing the prompt; enqueues the prompt (`source: user_prompt`); disarms | JSON: `hookSpecificOutput.additionalContext` (functional in Claude Code), plus `additional_context`, `content_blocks` and `metadata` for custom routers |
 | Manual | `append-compact.py --status` | State file | — | JSON status |
 | Manual | `append-compact.py --reset` | — | Replaces state with an empty one | JSON |
 | Manual | `append-compact.py --force-inject` | State file | — | Injection JSON regardless of arming |
@@ -177,11 +185,11 @@ process exits 0.
 | Python code | fenced `python`/`py`/`python3` | `python-minifier`: comments, docstrings/literal statements, `pass`, imports combined; verified by `compile()` | CPU, milliseconds | Conservative line-level pass |
 | JSON | fenced `json`/`jsonc` and standalone JSON objects/arrays | `json.loads` → `json.dumps(obj, separators=(",", ":"))` | CPU, microseconds | Invalid JSON is left byte-for-byte untouched |
 | Other code | fenced non-Python languages | Line-level deletion of comment-only lines, empty imports, and debug statements (`console.log/debug/trace`, `logger.debug`, `System.out.println`, `dbg!(`, `print(`); guarded against emptying block bodies, breaking continuations, and editing multi-line strings; shebangs and `eslint`/`@ts-*`/`noqa`/`pylint` directives are kept | CPU, microseconds | Lines that cannot be removed safely are kept |
-| Prose | natural-language paragraphs ≥160 chars | Selective LLMLingua-2 (`microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank`, rate `0.4`). Inline code, URLs, file paths, dotted/snake_case/camelCase identifiers are masked, passed as `force_tokens`, then restored | Model call (lazy, CPU) | Whitespace normalization; also forced when a mask is lost, entity extraction changes, output is not smaller, or the compressor raises |
+| Prose | natural-language paragraphs ≥160 chars | Selective LLMLingua-2 (`microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank`, rate `0.4`). Inline code, URLs, file paths, dotted/snake_case/camelCase identifiers, and decimals/versions/numbers with units (`7.592s`, `99%`, `2.15.0`, `512MB`) are masked, passed as `force_tokens`, then restored byte-exact | Model call (lazy, CPU) | Whitespace normalization; also forced when a mask is lost, entity extraction changes, output is not smaller, or the compressor raises |
 | Error text | paragraphs matching `Traceback`, `Error`, `Exception`, `panic`, `FAILED`, etc. | Never model-compressed; kept verbatim | none | — |
 | Ledger | every chunk | Deterministic regex extraction of file paths and exported/top-level symbols; sorted and deduped | CPU, microseconds | Empty ledger → `- (none)` |
 | L1 | every turn | Immutable `### Summary Chunk #N` block | none | — |
-| L2 | exactly when 6 active L1 exist | Immutable `### Consolidated Master Summary (L2) #M` covering the oldest 6: union ledger + per-chunk digests bounded to ~480 chars each | CPU | — |
+| L2 | exactly when 6 active L1 of one session exist | Immutable `### Consolidated Master Summary (L2) #M` covering the oldest 6 of that session: union ledger + per-chunk digests bounded to ~480 chars each | CPU | — |
 
 The mention of `Error` is intentionally broad: a paragraph containing a marker
 is more valuable when preserved verbatim. Note that the LLMLingua masks are
@@ -204,6 +212,8 @@ Default path: `~/.claude/append_compactor_state.json` (override with `--state` o
       "n": 1,
       "created": "2026-10-31T00:01:00Z",
       "source": "user_prompt",
+      "session": "session-id",
+      "input_sha": "5f2c...e1",
       "entities": ["path: src/app.ts", "symbol: buildThing"],
       "compressed_text": "Please update src/app.ts ...",
       "block": "### Summary Chunk #1\nSource: user_prompt\n**Entity Ledger:**\n- path: src/app.ts\n- symbol: buildThing\n**Turn:**\n...",
@@ -222,9 +232,25 @@ Default path: `~/.claude/append_compactor_state.json` (override with `--state` o
     {
       "n": 1,
       "created": "2026-10-31T00:10:00Z",
+      "session": "session-id",
       "covered": [1, 2, 3, 4, 5, 6],
       "entities": ["path: src/app.ts", "symbol: buildThing"],
       "block": "### Consolidated Master Summary (L2) #1\nCovers Summary Chunks #1–#6\n..."
+    }
+  ],
+  "pending": [
+    {
+      "id": "5c1f...a2",
+      "session": "session-id",
+      "source": "precompact",
+      "created": "2026-10-31T00:09:01Z",
+      "created_at": 1793491741.2,
+      "status": "working",
+      "worker": "48213",
+      "claimed_at": 1793491741.4,
+      "input_sha": "5f2c...e1",
+      "entities": ["path: src/app.ts"],
+      "text": "...raw turn, truncated to 24,000 chars..."
     }
   ],
   "armed_sessions": {
@@ -245,6 +271,19 @@ Default path: `~/.claude/append_compactor_state.json` (override with `--state` o
 Timestamps exist only in chunk/master **metadata** (`created`, `armed_sessions`,
 `last_event`). They are never written into `block`, so block text is stable
 across regenerations.
+
+`session`, `input_sha` and `pending` are additive optional fields; the schema
+number stays `1`, and older readers ignore them. Two compatibility rules apply:
+
+- A chunk, master or job **without** a `session` (written by ≤ 1.4) is treated
+  as belonging to no session and is skipped by scoped injection. It remains in
+  state and is still used by unscoped commands (`--status` without `--scope`,
+  `--force-inject`, `--emit-shared-block` without `--scope`).
+- `pending` holds raw, not-yet-compressed turns. Each job records the identity
+  of the captured turn (`input_sha`) so PreCompact re-runs are deduped, and
+  `status`/`worker`/`claimed_at` so exactly one worker can compress it. A
+  `working` claim older than `APPEND_COMPACT_CLAIM_TIMEOUT` is reclaimed, which
+  makes a killed worker harmless.
 
 ---
 
@@ -377,6 +416,125 @@ irrelevant or private detail into another agent's context.
 
 ---
 
+## Background compaction and parallel contexts
+
+Background compaction is **on by default** (`APPEND_COMPACT_BACKGROUND=1`).
+Hooks never wait for LLMLingua on the common path: they capture the raw turn,
+return immediately, and a detached worker process compresses it a moment later.
+`--no-background` (or `APPEND_COMPACT_BACKGROUND=0`) restores the synchronous
+1.4 behaviour.
+
+### Why a process, not a thread
+
+Claude Code hooks are short-lived processes and Claude Code enforces a timeout
+per hook (60 s; 120 s for PreCompact). A Python thread would die with the hook
+process, so the queue is drained by a **detached worker process** started with
+`start_new_session=True`, `stdin`/`stdout` on `/dev/null`, and its log in
+`~/.cache/append-compactor/workers/worker.log`. Workers are therefore
+independent of whichever hook spawned them and survive the hook's exit.
+
+### The queue protocol
+
+`pending` in the state file is the queue. Every transition happens under the
+same `flock` that protects all other state writes:
+
+1. **Capture** — `PreCompact` and `UserPromptSubmit` append a job
+   (`status: pending`) with the raw text, entities, session id and input hash.
+   PreCompact jobs are deduped by `input_sha`, so a repeated compaction of the
+   same transcript does not duplicate turns.
+2. **Claim** — a worker takes the lock, reclaims stale `working` claims older
+   than `APPEND_COMPACT_CLAIM_TIMEOUT`, then marks exactly one pending job
+   `working` for itself. PreCompact jobs go first: the next injection is
+   imminent after a compaction.
+3. **Compress** — the worker releases the lock and runs the full pipeline
+   (`llm="auto"`). This is the seconds-long part and never blocks hooks or
+   other contexts.
+4. **Commit** — the worker re-takes the lock, verifies it still owns the claim,
+   appends an immutable L1 chunk with the next global `n`, removes the job,
+   records stats, and consolidates that session's L2 if due.
+
+If a drain materialised the job in the meantime, the job is gone and the commit
+is dropped (no duplicate). If another worker reclaimed the claim, the old
+worker's commit is rejected. The state file is written with the usual temp file
++ `os.replace`, so readers always see a complete JSON document.
+
+### Bounded drain at injection time
+
+A correct injection must not be missing the turns that just happened. Therefore,
+only when an injection is actually armed (`SessionStart(compact)` or the next
+`UserPromptSubmit`), the hook:
+
+1. requests a worker (the machine-wide pool caps concurrency),
+2. waits up to `APPEND_COMPACT_DRAIN_WAIT` seconds (default **5**) for this
+   session's pending jobs to reach zero,
+3. commits whatever remains **deterministically** (`llm="off"`: code/JSON
+   minification and whitespace normalisation, no model call).
+
+The result is a complete, byte-deterministic snapshot inside both the 5-second
+drain window and the hook deadline. Ordinary prompts pay no drain cost at all.
+Workers also age out after `APPEND_COMPACT_WORKER_IDLE` idle seconds or
+`APPEND_COMPACT_WORKER_MAX_SECONDS` total lifetime, so a queue is not kept alive
+by a forgotten process.
+
+### Parallel contexts and agent swarms
+
+Many Claude Code contexts (and their subagents) may share one plugin install
+and one state file at the same time. Safety rests on four rules:
+
+- **One lock, short critical sections.** Model work is outside the lock. Hook
+  handlers only do regex/lexical work while holding it, so a swarm contends for
+  milliseconds, not seconds.
+- **One machine-wide worker pool.** `APPEND_COMPACT_WORKERS` (default **2**)
+  flocked slot files under `workers/` cap concurrent compression across *all*
+  sessions. A 30-agent fan-out therefore gets two LLMLingua processes, not 30;
+  each worker sets `OMP_NUM_THREADS`/`MKL_NUM_THREADS` to `cores / slots` so two
+  workers do not each spawn a full OpenMP pool. Extra turn capture stays cheap
+  and queued.
+- **Session isolation.** Chunks, masters and pending jobs are tagged with
+  `session_id`. Injection, consolidation, entity aggregation, shared blocks and
+  `--status` filter by session (or deliberately include everything when
+  `--scope` is omitted). Agent A can never receive agent B's prompt text, and
+  one long-running context cannot consolidate another's chunks into its L2.
+- **Bounded pressure.** At most `APPEND_COMPACT_MAX_PENDING` jobs per session
+  (default **32**) and `APPEND_COMPACT_MAX_PENDING_TOTAL` jobs machine-wide
+  (default **64**) are queued. Past either limit, the turn is committed
+  immediately with the deterministic pipeline instead of growing the queue.
+  Both the state file and the worker backlog stay bounded even if the workers
+  are busy or the model is unavailable, which matters because every hook saves
+  the whole state under one lock.
+
+Workers run at nice 10 (`APPEND_COMPACT_WORKER_NICE`) and are otherwise normal
+processes; on a loaded box they yield to the terminal. Heartbeats
+(`workers/<pid>.json`) record status and jobs done; `--status` exposes
+`pending_by_session` and per-session chunk counts.
+
+### Operating it
+
+```sh
+# what is queued, per session
+python3 hooks/scripts/append-compact.py --status | jq '.pending, .pending_by_session'
+
+# one session's view only
+python3 hooks/scripts/append-compact.py --status --scope "$SESSION_ID"
+
+# see what a worker is doing / why it failed
+cat ~/.cache/append-compactor/workers/*.json
+tail ~/.cache/append-compactor/workers/worker.log
+```
+
+The queue is not a durable job system: it lives in the state file, claims are
+reclaimed after the timeout, and an unfinished job is materialised
+deterministically at the next armed injection. That is intentional — losing
+model compression is acceptable; losing a turn is not.
+
+Contexts that share a state file must also share `APPEND_COMPACT_CACHE_DIR`:
+worker slots and the spawn gate are per cache directory. The defaults already
+do this. Overriding the two independently can let two pools run against one
+state; that is still safe (the state lock and claim protocol hold), but the
+machine-wide worker cap no longer applies.
+
+---
+
 ## cache_control, OpenRouter and model routing
 
 ### What Claude Code actually does
@@ -449,6 +607,15 @@ ignores them.
 | `APPEND_COMPACT_STATE` | `~/.claude/append_compactor_state.json` | State file path (overridden by `--state` when given) |
 | `APPEND_COMPACT_LLM` | enabled | Set to `0`/`false`/`off`/`no`/`disabled` to disable LLMLingua entirely (deterministic mode) |
 | `APPEND_COMPACT_LLM_MODEL` | `microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank` | Override the LLMLingua-2 model |
+| `APPEND_COMPACT_BACKGROUND` | enabled | Compress queued turns in detached workers. Set to `0`/`false`/`off` for synchronous compression; `--no-background` does the same for one invocation |
+| `APPEND_COMPACT_WORKERS` | `2` | Machine-wide concurrent worker slots (flocked files); also divides `OMP_NUM_THREADS`/`MKL_NUM_THREADS` among workers |
+| `APPEND_COMPACT_WORKER_IDLE` | `120` | Seconds an idle worker waits before exiting |
+| `APPEND_COMPACT_WORKER_MAX_SECONDS` | `900` | Maximum lifetime of one worker process |
+| `APPEND_COMPACT_WORKER_NICE` | `10` | `os.nice` value applied by a worker (POSIX) |
+| `APPEND_COMPACT_CLAIM_TIMEOUT` | `300` | Seconds after which a `working` job is reclaimed (e.g. the worker was killed) |
+| `APPEND_COMPACT_MAX_PENDING` | `32` | Per-session queue cap; beyond it turns are committed deterministically instead of queued |
+| `APPEND_COMPACT_MAX_PENDING_TOTAL` | `64` | Machine-wide queue cap across all sessions; bounds state-file size and worker backlog under a large swarm |
+| `APPEND_COMPACT_DRAIN_WAIT` | `5` | Bounded wait before an armed injection; remaining jobs are then materialised with `llm="off"` |
 | `APPEND_COMPACT_MAX_INJECT_CHARS` | `9000` | Hard cap on injected context, clamped to 9800 (Claude Code's per-string hook-output wall is 10,000); oldest material dropped first |
 | `APPEND_COMPACT_PRECOMPACT_TURNS` | `24` | Number of recent transcript turns captured on PreCompact |
 | `APPEND_COMPACT_PRECOMPACT_CHARS` | `24000` | Character cap for captured transcript text |
@@ -467,14 +634,29 @@ ignores them.
 - **LLMLingua is lazy and heavy.** The first compressible paragraph triggers
   `torch` plus model loading (a measured cold start of ~40 s on one CPU machine,
   including the model load; gigabytes of RAM, and a one-time model download).
-  Both hook timeouts are 60 s except `PreCompact` (120 s), so a cold start can
-  approach the limit on a loaded machine. Consider `APPEND_COMPACT_LLM=0`, or
-  pre-warm the model outside the hook.
+  With background compaction (the default) that cost is paid by a detached
+  worker, not by the hook; only the bounded drain at an armed injection can wait
+  for it. Consider `APPEND_COMPACT_LLM=0`, or pre-warm the model outside the
+  hook.
 - **Code and JSON layers are CPU-only and fast**; they are safe to run on every
   turn.
+- **LLMLingua-2 is the only prose backend, and that is a measured choice.**
+  [`bench/`](bench/README.md) compares it with three local Ollama models and
+  LLMLingua→Ollama chains on real turns: no generative arm beat its 48.0 %
+  shrink or its 100 % entity/number recall, every chain was smaller but worse
+  and 5–30 s slower per turn, and generative output was not reproducible across
+  models or runs even at `temperature=0` (`llama3.2:3b` still differed within a
+  run). Background workers, not a generative backend, are what keep that cost
+  off the hook path. The benchmark also surfaced a real defect: LLMLingua was
+  splitting decimals (`7.592` → `7 592`); numeric literals are now masked before
+  compression and restored byte-exact.
 - The hook reads the transcript only on PreCompact, not on every prompt. It does
-  not re-ingest the live transcript each turn; the current prompt is appended
+  not re-ingest the live transcript each turn; the current prompt is captured
   directly.
+- **Background workers are shared machine-wide.** Two workers normally suffice;
+  increase `APPEND_COMPACT_WORKERS` only on a machine with spare cores and
+  memory. Torch memory is per worker, so each additional slot costs RAM even
+  when idle.
 - State grows without bound over a long project. Injection is capped, but the
   state file accumulates all L1 chunks and L2 masters. Use `--reset` to start
   fresh.
@@ -496,8 +678,21 @@ ignores them.
 - **No LLMLingua without `llmlingua`/`torch`**, and no model download is
   attempted by this plugin's tests. The fallback is deterministic whitespace
   normalization.
-- **Windows locking.** `flock` is unavailable on Windows, so state writes are
-  not serialized there (the plugin targets macOS/Linux).
+- **Windows locking and workers.** `flock` is unavailable on Windows, so state
+  writes are not serialized and background workers are not spawned there; the
+  hook falls back to synchronous compression. The plugin targets macOS/Linux.
+- **The queue is best-effort, not a job system.** A job's model compression can
+  be lost to a crash or timeout; the turn itself is not lost, because the next
+  armed injection materialises leftovers deterministically. `pending` churn is
+  visible in `--status`.
+- **Queued turn text is capped at 24,000 characters.** Entities are extracted
+  from the full text before truncation, so paths and symbols beyond the cap
+  still reach the ledger; only the compressed turn body is bounded.
+- **Legacy session-less data is invisible to scoped injection.** Chunks and
+  masters from ≤ 1.4 carry no `session`; if you have such state, scoped
+  `--inject`/hooks skip them until `--reset` (or you merge them deliberately).
+  This is intentional: mixing an unknown context's turns into every agent is
+  worse than starting fresh.
 - **Caching is not guaranteed.** See above: the plugin provides stable prefixes,
   not hit-rate promises.
 - **Masks are heuristics.** A compressor that loses a placeholder, changes
