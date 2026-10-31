@@ -1,0 +1,552 @@
+"""Tests for hooks/scripts/append-compact.py.
+
+The hook file has a hyphen in its name, so it is loaded with importlib instead
+of a normal import.  Every test runs against an isolated log path and tmp state;
+nothing touches the real ``~/.claude`` state file.
+"""
+
+from __future__ import annotations
+
+import copy
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import types
+from argparse import Namespace
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_PATH = REPO_ROOT / "hooks" / "scripts" / "append-compact.py"
+
+_spec = importlib.util.spec_from_file_location("append_compact", SCRIPT_PATH)
+compactor = importlib.util.module_from_spec(_spec)
+assert _spec.loader is not None
+_spec.loader.exec_module(compactor)
+
+
+LONG_PROSE = (
+    "We should carefully inspect src/app.ts before changing buildThing, because the "
+    "initialization sequence is fragile and the current implementation repeats several "
+    "expensive checks on every request in the hot path.\n\n"
+    "The team agreed to document each step so future readers can reproduce the result."
+)
+
+ERROR_PROSE = (
+    "Traceback (most recent call last):\n"
+    '  File "src/app.ts", line 12, in buildThing\n'
+    "    initialize the connection pool before the first request and keep every handle "
+    "closed on the failure path so nothing leaks and the process can recover cleanly."
+)
+
+
+@pytest.fixture(autouse=True)
+def isolated_environment(tmp_path, monkeypatch):
+    """Keep logs and compressor globals test-local."""
+    monkeypatch.setenv("APPEND_COMPACT_LOG", str(tmp_path / "error.log"))
+    monkeypatch.delenv("APPEND_COMPACT_LLM", raising=False)
+    monkeypatch.delenv("OPENROUTER_EXTRA_HEADERS", raising=False)
+    monkeypatch.setattr(compactor, "_compressor", None)
+    monkeypatch.setattr(compactor, "_compressor_failed", False)
+    yield
+
+
+def _fresh_state() -> dict:
+    return compactor.new_state()
+
+
+def _append(state: dict, text: str, source: str = "user_prompt") -> dict:
+    chunk = compactor.append_turn(state, text, source=source, llm="off")
+    assert chunk is not None
+    return chunk
+
+
+# ---------------------------------------------------------------------------
+# Python minification
+# ---------------------------------------------------------------------------
+
+def test_python_minifier_shrinks_removes_docstrings_and_runs():
+    source = (
+        '"""Module docstring that should disappear."""\n'
+        "# a leading comment\n"
+        "import os\n\n\n"
+        "def add(a, b):\n"
+        '    """Add two numbers; this docstring should disappear."""\n'
+        "    # inline comment\n"
+        "    return a + b\n"
+    )
+    mini = compactor.minify_python_source(source)
+    assert mini is not None
+    assert len(mini) < len(source)
+    assert "docstring" not in mini
+    assert "#" not in mini
+
+    namespace: dict = {}
+    exec(compile(mini, "<minified>", "exec"), namespace)
+    assert namespace["add"](2, 3) == 5
+
+
+def test_python_minifier_leaves_invalid_source_alone():
+    assert compactor.minify_python_source("def broken(:\n") is None
+
+
+# ---------------------------------------------------------------------------
+# Line-level deletion
+# ---------------------------------------------------------------------------
+
+def test_line_level_deletes_debug_and_comment_only_lines():
+    js = "// comment\nconsole.log('debug')\nconst keep = 1;\n"
+    stripped = compactor.strip_line_level(js, "javascript")
+    assert "console.log" not in stripped
+    assert "// comment" not in stripped
+    assert "const keep = 1;" in stripped
+
+
+def test_line_level_never_empties_a_block_body():
+    js = 'if (flag) {\n  print("sole child");\n}\n'
+    stripped = compactor.strip_line_level(js, "javascript")
+    assert 'print("sole child");' in stripped
+
+    python = "def f():\n    # only comment before the statement\n    print('sole child')\n"
+    stripped_py = compactor.strip_line_level(python, "python")
+    assert "print('sole child')" in stripped_py
+
+
+def test_line_level_keeps_eslint_directive():
+    js = "// eslint-disable-next-line no-console\nconsole.log('debug')\nconst keep = 1;\n"
+    stripped = compactor.strip_line_level(js, "javascript")
+    assert "eslint-disable-next-line" in stripped
+    assert "console.log" not in stripped
+    assert "const keep = 1;" in stripped
+
+
+def test_line_level_never_edits_inside_multiline_strings():
+    js = 'const text = `\nconsole.log("inside a template literal")\n`;\nconst keep = 1;\n'
+    stripped = compactor.strip_line_level(js, "javascript")
+    assert 'console.log("inside a template literal")' in stripped
+    assert "const keep = 1;" in stripped
+
+    py = 'note = """\nprint("inside a python string")\n"""\nvalue = 1\n'
+    stripped_py = compactor.strip_line_level(py, "python")
+    assert 'print("inside a python string")' in stripped_py
+    assert "value = 1" in stripped_py
+
+
+def test_line_level_skips_continuations():
+    js = "const value = foo(\n  // explanatory comment\n  bar\n);\n"
+    stripped = compactor.strip_line_level(js, "javascript")
+    assert "bar" in stripped
+
+
+# ---------------------------------------------------------------------------
+# LLMLingua-2 lazy import, fallback and masking
+# ---------------------------------------------------------------------------
+
+def test_llm_off_falls_back_to_deterministic_normalization():
+    text, mode = compactor.compress_prose(LONG_PROSE, llm="off")
+    assert mode == "fallback"
+    assert text == compactor._normalize_prose(LONG_PROSE)
+
+
+def test_env_flag_disables_llm(monkeypatch):
+    monkeypatch.setenv("APPEND_COMPACT_LLM", "0")
+    _, mode = compactor.compress_prose(LONG_PROSE, llm="auto")
+    assert mode == "fallback"
+
+
+def test_import_failure_falls_back(monkeypatch):
+    fake = types.ModuleType("llmlingua")
+
+    class PromptCompressor:  # noqa: D401 - test double
+        def __init__(self, **kwargs):
+            raise RuntimeError("model unavailable in test")
+
+    fake.PromptCompressor = PromptCompressor
+    monkeypatch.setitem(sys.modules, "llmlingua", fake)
+    monkeypatch.delenv("APPEND_COMPACT_LLM", raising=False)
+
+    text, mode = compactor.compress_prose(LONG_PROSE, llm="auto")
+    assert mode == "fallback"
+    assert text == compactor._normalize_prose(LONG_PROSE)
+
+
+def test_callable_that_raises_falls_back():
+    def boom(masked, rate, force_tokens):
+        raise RuntimeError("compressor blew up")
+
+    text, mode = compactor.compress_prose(LONG_PROSE, llm=boom)
+    assert mode == "fallback"
+    assert text == compactor._normalize_prose(LONG_PROSE)
+
+
+def test_callable_that_drops_masks_falls_back():
+    def drops(masked, rate, force_tokens):
+        return "short summary with no placeholders"
+
+    text, mode = compactor.compress_prose(LONG_PROSE, llm=drops)
+    assert mode == "fallback"
+    assert text == compactor._normalize_prose(LONG_PROSE)
+
+
+def test_working_callable_preserves_and_restores_entities():
+    seen = {}
+
+    def fake(masked, rate, force_tokens):
+        seen["rate"] = rate
+        seen["force_tokens"] = list(force_tokens)
+        for placeholder in force_tokens:
+            assert placeholder in masked
+        return re.sub(r"\b(carefully|several|expensive|future|fragile) ", "", masked)
+
+    text, mode = compactor.compress_prose(LONG_PROSE, llm=fake)
+    assert mode == "llmlingua"
+    assert seen["rate"] == 0.4
+    assert seen["force_tokens"]
+    assert "src/app.ts" in text
+    assert "buildThing" in text
+    assert len(text) < len(compactor._normalize_prose(LONG_PROSE))
+    assert set(compactor.extract_entities(text)) == set(compactor.extract_entities(LONG_PROSE))
+
+
+def test_error_paragraphs_are_never_compressed():
+    calls = []
+
+    def fake(masked, rate, force_tokens):
+        calls.append(masked)
+        return "compressed"
+
+    text, mode = compactor.compress_prose(ERROR_PROSE, llm=fake)
+    assert mode == "error-verbatim"
+    assert text == ERROR_PROSE
+    assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# Entity ledger
+# ---------------------------------------------------------------------------
+
+def test_entity_extraction_exact_and_deterministic():
+    text = (
+        "Please update src/app.ts and ./lib/util.py.\n"
+        "export function buildThing() {}\n"
+        "export { helper as renamed };\n"
+        "def handler():\n"
+        "    return 1\n"
+        "pub fn run_task() {}\n"
+    )
+    expected = [
+        "path: ./lib/util.py",
+        "path: src/app.ts",
+        "symbol: buildThing",
+        "symbol: handler",
+        "symbol: renamed",
+        "symbol: run_task",
+    ]
+    assert compactor.extract_entities(text) == expected
+    assert compactor.extract_entities(text) == expected  # stable across calls
+
+
+def test_entity_extraction_plain_prose_and_windows_path():
+    assert compactor.extract_entities("hello world") == []
+    entities = compactor.extract_entities(r"C:\Users\dev\project\main.go")
+    assert "path: C:\\Users\\dev\\project\\main.go" in entities
+
+
+# ---------------------------------------------------------------------------
+# JSON minification
+# ---------------------------------------------------------------------------
+
+def test_json_minification():
+    assert compactor.minify_json_text('{"a": 1, "b": [2, 3]}') == '{"a":1,"b":[2,3]}'
+    assert compactor.minify_json_text("not json") is None
+    assert compactor.minify_json_text('"scalar"') is None
+
+
+def test_fenced_and_standalone_json_are_compacted():
+    fenced = '```json\n{"a": 1, "b": [2, 3]}\n```'
+    assert compactor.compress_text(fenced, llm="off")[0] == '```json\n{"a":1,"b":[2,3]}\n```'
+
+    standalone = '{"a": 1, "b": [2, 3]}'
+    assert compactor.compress_text(standalone, llm="off")[0] == '{"a":1,"b":[2,3]}'
+
+
+def test_invalid_json_is_never_touched():
+    standalone = '{"a": }'
+    assert compactor.compress_text(standalone, llm="off")[0] == standalone
+
+    fenced = '```json\n{"a": }\n```'
+    assert compactor.compress_text(fenced, llm="off")[0] == fenced
+
+
+# ---------------------------------------------------------------------------
+# Append-only L1
+# ---------------------------------------------------------------------------
+
+def test_l1_chunk_is_append_only_across_save_and_reload(tmp_path):
+    state = _fresh_state()
+    first = _append(state, "first turn about src/app.ts", source="user_prompt")
+    block = first["block"]
+    snapshot = copy.deepcopy(first)
+
+    _append(state, "second turn about src/other.ts")
+    assert state["l1_chunks"][0]["block"] == block
+    assert state["l1_chunks"][0] == snapshot
+    assert block.startswith("### Summary Chunk #1")
+    assert re.search(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", block) is None
+
+    state_path = tmp_path / "state.json"
+    compactor.save_state(state, state_path)
+    reloaded = compactor.load_state(state_path)
+    assert reloaded["l1_chunks"][0]["block"] == block
+    assert reloaded["l1_chunks"][0] == snapshot
+
+
+# ---------------------------------------------------------------------------
+# L2 consolidation
+# ---------------------------------------------------------------------------
+
+def test_l2_consolidation_triggers_exactly_at_six():
+    state = _fresh_state()
+    blocks_before = []
+    for index in range(5):
+        chunk = _append(state, f"turn {index} touches src/module_{index}.py")
+        blocks_before.append(chunk["block"])
+
+    assert state["l2_masters"] == []
+    assert [c["n"] for c in compactor.active_l1(state)] == [1, 2, 3, 4, 5]
+
+    sixth = _append(state, "turn 5 touches src/module_5.py")
+    assert len(state["l2_masters"]) == 1
+    master = state["l2_masters"][0]
+    assert master["covered"] == [1, 2, 3, 4, 5, 6]
+    assert "Consolidated Master Summary (L2) #1" in master["block"]
+    assert master["block"].startswith("### Consolidated Master Summary (L2) #1")
+    assert compactor.active_l1(state) == []
+
+    # Past chunk blocks and dicts are byte-identical after consolidation.
+    for index, block in enumerate(blocks_before):
+        assert state["l1_chunks"][index]["block"] == block
+    assert sixth["block"] == state["l1_chunks"][5]["block"]
+
+    seventh = _append(state, "turn 6 touches src/module_6.py")
+    assert len(state["l2_masters"]) == 1
+    assert [c["n"] for c in compactor.active_l1(state)] == [7]
+    assert seventh["n"] == 7
+
+
+def test_l2_handles_multiple_batches_in_a_loop():
+    state = _fresh_state()
+    for index in range(12):
+        _append(state, f"turn {index} touches src/module_{index}.py")
+
+    assert [m["covered"] for m in state["l2_masters"]] == [
+        [1, 2, 3, 4, 5, 6],
+        [7, 8, 9, 10, 11, 12],
+    ]
+    assert compactor.active_l1(state) == []
+
+
+# ---------------------------------------------------------------------------
+# Injection payload
+# ---------------------------------------------------------------------------
+
+def _state_with_master_and_active() -> dict:
+    state = _fresh_state()
+    for index in range(7):
+        _append(state, f"turn {index} touches src/module_{index}.py")
+    assert len(state["l2_masters"]) == 1
+    assert [c["n"] for c in compactor.active_l1(state)] == [7]
+    return state
+
+
+def test_injection_payload_shape_order_and_cache_control(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_EXTRA_HEADERS", raising=False)
+    state = _state_with_master_and_active()
+    payload = compactor.injection_payload(state)
+
+    assert payload is not None
+    assert payload["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
+    assert payload["additional_context"] == payload["hookSpecificOutput"]["additionalContext"]
+    assert "additional_context" in payload  # kept for custom routers
+
+    blocks = payload["content_blocks"]
+    assert len(blocks) == 2
+    assert all(block["type"] == "text" for block in blocks)
+    assert all(block["cache_control"] == {"type": "ephemeral"} for block in blocks)
+    assert "Consolidated Master Summary (L2) #1" in blocks[0]["text"]
+    assert "Summary Chunk #7" in blocks[1]["text"]
+
+    text = payload["additional_context"]
+    assert text.index("Consolidated Master Summary (L2) #1") < text.index("Summary Chunk #7")
+    assert payload["metadata"]["compactor"]["l2_masters"] == 1
+    assert payload["metadata"]["compactor"]["active_l1"] == 1
+    assert "openrouter_extra_headers" not in payload["metadata"]
+
+
+def test_openrouter_headers_support_json_and_list_forms(monkeypatch):
+    state = _state_with_master_and_active()
+
+    monkeypatch.setenv(
+        "OPENROUTER_EXTRA_HEADERS",
+        '{"HTTP-Referer": "https://example.com", "X-OpenRouter-Title": "my app"}',
+    )
+    payload = compactor.injection_payload(state)
+    assert payload["metadata"]["openrouter_extra_headers"] == {
+        "HTTP-Referer": "https://example.com",
+        "X-OpenRouter-Title": "my app",
+    }
+
+    monkeypatch.setenv(
+        "OPENROUTER_EXTRA_HEADERS",
+        "X-OpenRouter-Title: My App, HTTP-Referer: https://example.com",
+    )
+    assert compactor._openrouter_extra_headers() == {
+        "X-OpenRouter-Title": "My App",
+        "HTTP-Referer": "https://example.com",
+    }
+
+
+def test_injection_cap_drops_oldest_master_first():
+    state = _fresh_state()
+    filler = "implementation detail " * 40
+    for index in range(7):
+        _append(state, f"turn {index} {filler} src/module_{index}.py")
+
+    payload = compactor.injection_payload(state, max_chars=700)
+    assert payload is not None
+    text = payload["additional_context"]
+    assert len(text) <= 700
+    assert payload["metadata"]["compactor"]["dropped_l2"] == 1
+    assert "Consolidated Master Summary (L2) #1" not in text
+    assert text.endswith("[append-compactor: truncated to APPEND_COMPACT_MAX_INJECT_CHARS]")
+
+
+# ---------------------------------------------------------------------------
+# Hook events
+# ---------------------------------------------------------------------------
+
+def _write_transcript(path: Path) -> None:
+    records = [
+        {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": "Please fix src/app.ts and export function buildThing() {}"}],
+            },
+        },
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Updating src/app.ts and buildThing now."}],
+            },
+        },
+    ]
+    path.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+
+
+def test_precompact_returns_plain_text_and_arms_session(tmp_path):
+    transcript = tmp_path / "transcript.jsonl"
+    _write_transcript(transcript)
+    state = _fresh_state()
+
+    result = compactor.handle_precompact_event(
+        state,
+        {"session_id": "session-1", "transcript_path": str(transcript), "trigger": "auto"},
+        Namespace(),
+    )
+
+    assert isinstance(result, str)
+    assert not result.lstrip().startswith("{")
+    assert "Entity Ledger" in result
+    assert "src/app.ts" in result
+    assert len(result) < 10_000
+    assert state["armed_sessions"]["session-1"]["armed"] is True
+    assert len(state["l1_chunks"]) == 2
+    assert all(chunk["source"] == "precompact" for chunk in state["l1_chunks"])
+
+
+def test_prompt_injects_history_before_appending_and_disarms(tmp_path):
+    transcript = tmp_path / "transcript.jsonl"
+    _write_transcript(transcript)
+    state = _fresh_state()
+    compactor.handle_precompact_event(
+        state,
+        {"session_id": "session-1", "transcript_path": str(transcript)},
+        Namespace(),
+    )
+
+    args = Namespace(prompt="Now also check src/other.ts", force_inject=False, inject=True)
+    injected = compactor.handle_prompt_event(
+        state, {"session_id": "session-1", "prompt": args.prompt}, args
+    )
+
+    assert isinstance(injected, dict)
+    context = injected["hookSpecificOutput"]["additionalContext"]
+    assert injected["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
+    assert "src/app.ts" in context          # history is injected
+    assert "src/other.ts" not in context    # current prompt is appended after injection
+    assert "session-1" not in state["armed_sessions"]
+    assert state["l1_chunks"][-1]["source"] == "user_prompt"
+    assert "src/other.ts" in state["l1_chunks"][-1]["compressed_text"]
+
+    # A later prompt is not injected because the session was disarmed.
+    args2 = Namespace(prompt="another prompt", force_inject=False, inject=True)
+    assert compactor.handle_prompt_event(state, {"session_id": "session-1"}, args2) is None
+
+
+def test_main_precompact_emits_raw_stdout_and_exits_zero(tmp_path):
+    transcript = tmp_path / "transcript.jsonl"
+    _write_transcript(transcript)
+    state_path = tmp_path / "state.json"
+    payload = {
+        "session_id": "session-2",
+        "hook_event_name": "PreCompact",
+        "transcript_path": str(transcript),
+        "trigger": "auto",
+    }
+    env = dict(os.environ)
+    env["APPEND_COMPACT_LOG"] = str(tmp_path / "error.log")
+    env["APPEND_COMPACT_LLM"] = "0"
+
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPT_PATH), "--event", "precompact", "--state", str(state_path)],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=60,
+    )
+
+    assert proc.returncode == 0
+    assert proc.stdout.strip()
+    assert not proc.stdout.lstrip().startswith("{")
+    assert "Entity Ledger" in proc.stdout
+
+    saved = json.loads(state_path.read_text(encoding="utf-8"))
+    assert saved["armed_sessions"]["session-2"]["armed"] is True
+
+
+def test_prompt_flag_does_not_read_stdin(tmp_path, monkeypatch):
+    """A manual --prompt run must not block waiting for hook JSON on stdin."""
+    def boom(*args, **kwargs):
+        raise AssertionError("stdin must not be read when --prompt is supplied")
+
+    monkeypatch.setattr(compactor, "_read_stdin_payload", boom)
+    state_path = tmp_path / "state.json"
+
+    rc = compactor.main([
+        "--state", str(state_path),
+        "--event", "prompt",
+        "--prompt", "Manual prompt touching src/manual.ts",
+        "--no-llm",
+    ])
+
+    assert rc == 0
+    saved = compactor.load_state(state_path)
+    assert len(saved["l1_chunks"]) == 1
+    assert "src/manual.ts" in saved["l1_chunks"][0]["block"]

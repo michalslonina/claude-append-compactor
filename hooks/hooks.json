@@ -1,0 +1,27 @@
+{
+  "description": "Append-only context checkpointing: capture turns on prompt submit, snapshot the transcript before compaction, and emit deterministic summary chunks with ephemeral cache markers.",
+  "hooks": {
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/append-compact.py\" --event precompact",
+            "timeout": 120
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/append-compact.py\" --event prompt --inject",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  }
+}
