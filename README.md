@@ -151,9 +151,9 @@ python3 -m pip install --user --break-system-packages -r requirements.txt
 
 | Hook | Command | Reads | Writes | Output |
 | --- | --- | --- | --- | --- |
-| `PreCompact` | `append-compact.py --event precompact` | `transcript_path` JSONL, last `APPEND_COMPACT_PRECOMPACT_TURNS` text turns, capped at `APPEND_COMPACT_PRECOMPACT_CHARS`, plus condensed `tool_result` / `toolUseResult` output (6k chars total) | Queues each turn for background compression (`source: precompact`, deduped by input hash), falls back to an immediate deterministic L1 chunk if the queue is full, arms the session | **Plain text** on stdout. Current Claude Code versions append successful PreCompact stdout to their compaction instructions; treat that as best-effort, not a documented injection channel. |
+| `PreCompact` | `append-compact.py --event precompact` | `transcript_path` JSONL, last `APPEND_COMPACT_PRECOMPACT_TURNS` text turns, capped at `APPEND_COMPACT_PRECOMPACT_CHARS`, plus condensed `tool_result` / `toolUseResult` output (6k chars total) | Queues each turn for background compression (`source: precompact`). A durable normalized key plus a bounded similarity gate suppress a turn already captured by `UserPromptSubmit`; falls back to an immediate deterministic L1 chunk if the queue is full; arms the session | **Plain text** on stdout. Current Claude Code versions append successful PreCompact stdout to their compaction instructions; treat that as best-effort, not a documented injection channel. |
 | `SessionStart` (matcher `compact`) | `append-compact.py --event sessionstart --inject` | Hook JSON on stdin (`session_id`, `source`) | If armed: drains this session's queue within `APPEND_COMPACT_DRAIN_WAIT`, injects once at the documented post-compaction point and disarms | JSON: `hookSpecificOutput.additionalContext` with `hookEventName: "SessionStart"` |
-| `UserPromptSubmit` | `append-compact.py --event prompt --inject` | Hook JSON on stdin (`session_id`, `prompt`) | If still armed (SessionStart did not fire): drains this session's queue within `APPEND_COMPACT_DRAIN_WAIT`, then builds injection from history **before** enqueuing the prompt; enqueues the prompt (`source: user_prompt`); disarms | JSON: `hookSpecificOutput.additionalContext` (functional in Claude Code), plus `additional_context`, `content_blocks` and `metadata` for custom routers |
+| `UserPromptSubmit` | `append-compact.py --event prompt --inject` | Hook JSON on stdin (`session_id`, `prompt`) | If still armed (SessionStart did not fire): drains this session's queue within `APPEND_COMPACT_DRAIN_WAIT`, then builds injection from history **before** enqueuing the prompt; enqueues the prompt (`source: user_prompt`) unless a recent PreCompact capture already contains it; disarms | JSON: `hookSpecificOutput.additionalContext` (functional in Claude Code), plus `additional_context`, `content_blocks` and `metadata` for custom routers |
 | Manual | `append-compact.py --status` | State file | — | JSON status |
 | Manual | `append-compact.py --reset` | — | Replaces state with an empty one | JSON |
 | Manual | `append-compact.py --force-inject` | State file | — | Injection JSON regardless of arming |
@@ -186,14 +186,15 @@ process exits 0.
 | JSON | fenced `json`/`jsonc` and standalone JSON objects/arrays | `json.loads` → `json.dumps(obj, separators=(",", ":"))` | CPU, microseconds | Invalid JSON is left byte-for-byte untouched |
 | Other code | fenced non-Python languages | Line-level deletion of comment-only lines, empty imports, and debug statements (`console.log/debug/trace`, `logger.debug`, `System.out.println`, `dbg!(`, `print(`); guarded against emptying block bodies, breaking continuations, and editing multi-line strings; shebangs and `eslint`/`@ts-*`/`noqa`/`pylint` directives are kept | CPU, microseconds | Lines that cannot be removed safely are kept |
 | Prose | natural-language paragraphs ≥160 chars | Selective LLMLingua-2 (`microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank`, rate `0.4`). Inline code, URLs, file paths, dotted/snake_case/camelCase identifiers, and decimals/versions/numbers with units (`7.592s`, `99%`, `2.15.0`, `512MB`) are masked, passed as `force_tokens`, then restored byte-exact | Model call (lazy, CPU) | Whitespace normalization; also forced when a mask is lost, entity extraction changes, output is not smaller, or the compressor raises |
-| Error text | paragraphs matching `Traceback`, `Error`, `Exception`, `panic`, `FAILED`, etc. | Never model-compressed; kept verbatim | none | — |
+| Error text | paragraphs matching `Traceback`, `fatal error`, `panic:`, `SyntaxError`, `TypeError`, `ValueError`, `ImportError`, `npm ERR!`, `error TS…`, `failed to`, `segmentation fault`, or a line starting `error:`/`exception:` | Never model-compressed; kept verbatim | none | — |
 | Ledger | every chunk | Deterministic regex extraction of file paths and exported/top-level symbols; sorted and deduped | CPU, microseconds | Empty ledger → `- (none)` |
 | L1 | every turn | Immutable `### Summary Chunk #N` block | none | — |
 | L2 | exactly when 6 active L1 of one session exist | Immutable `### Consolidated Master Summary (L2) #M` covering the oldest 6 of that session: union ledger + per-chunk digests bounded to ~480 chars each | CPU | — |
 
-The mention of `Error` is intentionally broad: a paragraph containing a marker
-is more valuable when preserved verbatim. Note that the LLMLingua masks are
-heuristics, not a parser.
+A bare mention of the words “error” or “exception” no longer forces verbatim
+handling; the marker must look like a log line or a concrete exception. This
+lets prose such as “the error message was long” compress while a real traceback
+stays byte-exact. The LLMLingua masks remain heuristics, not a parser.
 
 ---
 
@@ -211,9 +212,12 @@ Default path: `~/.claude/append_compactor_state.json` (override with `--state` o
     {
       "n": 1,
       "created": "2026-10-31T00:01:00Z",
+      "created_at": 1793491260.0,
       "source": "user_prompt",
+      "role": "user",
       "session": "session-id",
       "input_sha": "5f2c...e1",
+      "capture_key": "a19d...77",
       "entities": ["path: src/app.ts", "symbol: buildThing"],
       "compressed_text": "Please update src/app.ts ...",
       "block": "### Summary Chunk #1\nSource: user_prompt\n**Entity Ledger:**\n- path: src/app.ts\n- symbol: buildThing\n**Turn:**\n...",
@@ -243,12 +247,14 @@ Default path: `~/.claude/append_compactor_state.json` (override with `--state` o
       "id": "5c1f...a2",
       "session": "session-id",
       "source": "precompact",
+      "role": "user",
       "created": "2026-10-31T00:09:01Z",
       "created_at": 1793491741.2,
       "status": "working",
       "worker": "48213",
       "claimed_at": 1793491741.4,
       "input_sha": "5f2c...e1",
+      "capture_key": "a19d...77",
       "entities": ["path: src/app.ts"],
       "text": "...raw turn, truncated to 24,000 chars..."
     }
@@ -256,6 +262,19 @@ Default path: `~/.claude/append_compactor_state.json` (override with `--state` o
   "armed_sessions": {
     "session-id": {"armed": true, "at": "2026-10-31T00:09:00Z", "trigger": "auto", "captured_turns": 24}
   },
+  "recent_captures": [
+    {
+      "capture_key": "a19d...77",
+      "source": "precompact",
+      "role": "user",
+      "session": "session-id",
+      "at": 1793491741.2,
+      "text": "comparison-only normalized text (user role only)",
+      "tokens": 42,
+      "shingles": 38
+    }
+  ],
+  "prompt_seen": {"session-id": 1793491800.0},
   "stats": {
     "turns": 7,
     "bytes_in": 900,
@@ -272,18 +291,30 @@ Timestamps exist only in chunk/master **metadata** (`created`, `armed_sessions`,
 `last_event`). They are never written into `block`, so block text is stable
 across regenerations.
 
-`session`, `input_sha` and `pending` are additive optional fields; the schema
-number stays `1`, and older readers ignore them. Two compatibility rules apply:
+`session`, `input_sha`, `role`, `capture_key`, `created_at`, `recent_captures`,
+`prompt_seen` and `pending` are additive optional fields; the schema number
+stays `1`, and older readers ignore them. Three compatibility rules apply:
 
 - A chunk, master or job **without** a `session` (written by ≤ 1.4) is treated
   as belonging to no session and is skipped by scoped injection. It remains in
   state and is still used by unscoped commands (`--status` without `--scope`,
   `--force-inject`, `--emit-shared-block` without `--scope`).
+- A chunk or job **without** `role`/`capture_key` (written by ≤ 1.5) is still
+  read normally, but takes no part in cross-source dedupe: only the legacy
+  `input_sha` PreCompact check sees it. New captures start populating the
+  fields; nothing needs migrating.
 - `pending` holds raw, not-yet-compressed turns. Each job records the identity
-  of the captured turn (`input_sha`) so PreCompact re-runs are deduped, and
-  `status`/`worker`/`claimed_at` so exactly one worker can compress it. A
-  `working` claim older than `APPEND_COMPACT_CLAIM_TIMEOUT` is reclaimed, which
-  makes a killed worker harmless.
+  of the captured turn (`input_sha` and the durable `capture_key`) so re-runs
+  and cross-source duplicates are deduped, and `status`/`worker`/`claimed_at`
+  so exactly one worker can compress it. A `working` claim older than
+  `APPEND_COMPACT_CLAIM_TIMEOUT` is reclaimed, which makes a killed worker
+  harmless.
+- `recent_captures` is a bounded (64-entry, `APPEND_COMPACT_DEDUPE_WINDOW`
+  second) ring of **comparison-only** normalized user text; it is never
+  injected and holds at most `PENDING_MAX_CHARS` characters per entry.
+  `prompt_seen` maps a session id to the timestamp of its last accepted prompt
+  (256 sessions, oldest pruned first). Both are validated and dropped if
+  malformed when the state is loaded.
 
 ---
 
@@ -439,9 +470,13 @@ independent of whichever hook spawned them and survive the hook's exit.
 same `flock` that protects all other state writes:
 
 1. **Capture** — `PreCompact` and `UserPromptSubmit` append a job
-   (`status: pending`) with the raw text, entities, session id and input hash.
-   PreCompact jobs are deduped by `input_sha`, so a repeated compaction of the
-   same transcript does not duplicate turns.
+   (`status: pending`) with the raw text, entities, session id, input hash and
+   normalized `capture_key`. A capture that duplicates an earlier one — the
+   same PreCompact turn re-read, or the same user turn seen by both hooks — is
+   dropped before it reaches the queue; see [Cross-source capture
+   dedupe](#cross-source-capture-dedupe). Duplicates are checked **before** the
+   queue-cap fallback, so a full queue cannot sneak one in as a synchronous
+   chunk.
 2. **Claim** — a worker takes the lock, reclaims stale `working` claims older
    than `APPEND_COMPACT_CLAIM_TIMEOUT`, then marks exactly one pending job
    `working` for itself. PreCompact jobs go first: the next injection is
@@ -457,6 +492,51 @@ If a drain materialised the job in the meantime, the job is gone and the commit
 is dropped (no duplicate). If another worker reclaimed the claim, the old
 worker's commit is rejected. The state file is written with the usual temp file
 + `os.replace`, so readers always see a complete JSON document.
+
+### Cross-source capture dedupe
+
+The same user turn legitimately arrives twice: `PreCompact` reads it out of
+the transcript and prefixes a `User:` label, while `UserPromptSubmit` captures
+the raw prompt. Those captures differ by a few bytes (the label, sometimes an
+injected `<system-reminder>` block, whitespace), so the exact `input_sha` the
+1.5 queue used could not see them as one turn. Two layers now do, with no extra
+dependency and without ever modifying captured text.
+
+**Durable key.** `capture_key` is `sha256` of the same `_normalize_prose` the
+plugin already applies: trailing whitespace and blank-line runs are ignored,
+line breaks and indentation are kept (so re-indented code does not collapse).
+A leading `User:`/`Assistant:`/`Tool:` label is stripped only for PreCompact,
+the one place that adds it. The key is stored on jobs and chunks, so it
+survives queueing, consolidation, and restarts.
+
+**Similarity gate.** Recent user captures also keep a comparison-only
+normalized copy (NFKC, casefolded, whitespace-collapsed, `<system-reminder>`
+blocks and role label removed). A candidate is matched on 5-word shingles
+(`zlib.crc32`) and word tokens, with a minimum of 20 tokens and 8 shingles
+before any fuzzy decision. The rules are deliberately asymmetric:
+
+| Incoming | May match | Rule |
+| --- | --- | --- |
+| PreCompact user turn | recent `user_prompt` | prompt is contained in the turn (substring, or shingle containment ≥ 0.95 and token containment ≥ 0.98), or shingle/token Jaccard ≥ 0.90 with 0.8–1.25× length |
+| Prompt | recent PreCompact user turn | prompt is contained in that capture; never the reverse, because a new prompt may add instructions |
+| anything else | — | no fuzzy match (prompt-vs-prompt, PreCompact-vs-PreCompact, assistant/tool turns are always kept) |
+
+Matching is always scoped to the same session and the user role, so parallel
+contexts and agent swarms cannot suppress one another's prompts. The prompt
+direction additionally requires the capture to be younger than
+`APPEND_COMPACT_CAPTURE_DEDUPE_SECONDS` (default 120) **and** newer than the
+session's last accepted prompt (`prompt_seen`), which means only the first
+prompt after a compaction can be absorbed; a deliberate repeat is captured as a
+new turn. The PreCompact direction has no age limit — chunks are append-only,
+so a duplicate remains a duplicate — while fuzzy comparison only looks at
+`recent_captures` inside `APPEND_COMPACT_DEDUPE_WINDOW` (default 900).
+
+Every drop is logged as a `dedupe` job-log event with its reason (`capture_key`,
+`substring`, `shingle`, `jaccard`), scores, and the matched source/role/time —
+never the text. `APPEND_COMPACT_DEDUPE=0` disables the new checks and leaves
+the legacy PreCompact `input_sha` dedupe in place. A missed duplicate costs one
+extra compression job; a false positive would silently lose a turn, which is
+why the thresholds are one-sided and conservative.
 
 ### Bounded drain at injection time
 
@@ -520,7 +600,30 @@ python3 hooks/scripts/append-compact.py --status --scope "$SESSION_ID"
 # see what a worker is doing / why it failed
 cat ~/.cache/append-compactor/workers/*.json
 tail ~/.cache/append-compactor/workers/worker.log
+
+# what happened to each captured turn, one JSON object per line
+tail -5 ~/.cache/append-compactor/jobs.log
+jq -c 'select(.event=="commit") | {id, session, source, duration, stats}' \
+  ~/.cache/append-compactor/jobs.log | tail -20
 ```
+
+`jobs.log` (override `APPEND_COMPACT_JOB_LOG`, rotated at 5 MB to
+`jobs.log.1`) records:
+
+| `event` | Written by | Fields |
+| --- | --- | --- |
+| `enqueue` | `enqueue_turn` | `id`, `session`, `source`, `role`, `bytes`, `key` (capture-key prefix) |
+| `inline` | queue-full fallback | `session`, `source`, `bytes` |
+| `dedupe` | capture check | `session`, `source`, `reason`, scores (`shingle_containment`, `token_containment`, `shingle_jaccard`, `token_jaccard`), `matched_source`, `age` |
+| `commit` | worker | `id`, `worker`, `session`, `source`, `duration`, `stats` (llm/fallback/error blocks, bytes in/out) |
+| `dropped` | worker | as `commit`; `commit_job` found the job already drained or reclaimed |
+| `error` | worker | `id`, `worker`, `session`, `source`, `error` (exception type/message) |
+
+Lines are written with `O_APPEND` so concurrent hooks and workers interleave
+whole lines. The log contains no turn text — only ids, hashes, lengths and
+timings. The worker wraps compression and commit in `try/except`: an unexpected
+raise is logged and the process continues with the next job instead of dying
+and leaving a `working` claim for the 300 s reclaim.
 
 The queue is not a durable job system: it lives in the state file, claims are
 reclaimed after the timeout, and an unfinished job is materialised
@@ -619,12 +722,16 @@ ignores them.
 | `APPEND_COMPACT_MAX_INJECT_CHARS` | `9000` | Hard cap on injected context, clamped to 9800 (Claude Code's per-string hook-output wall is 10,000); oldest material dropped first |
 | `APPEND_COMPACT_PRECOMPACT_TURNS` | `24` | Number of recent transcript turns captured on PreCompact |
 | `APPEND_COMPACT_PRECOMPACT_CHARS` | `24000` | Character cap for captured transcript text |
+| `APPEND_COMPACT_DEDUPE` | enabled | Set to `0`/`false`/`off` to disable cross-source `capture_key` and similarity dedupe; the legacy PreCompact `input_sha` check stays on |
+| `APPEND_COMPACT_DEDUPE_WINDOW` | `900` | Seconds of recent captures kept for similarity comparison; older entries are pruned |
+| `APPEND_COMPACT_CAPTURE_DEDUPE_SECONDS` | `120` | How recent a PreCompact capture must be before it can absorb an incoming prompt |
 | `APPEND_COMPACT_CACHE` | enabled | Set to `0`/`false`/`off` to disable the compression memo (reads and writes) |
 | `APPEND_COMPACT_CACHE_DIR` | `~/.cache/append-compactor` | Root for the compression memo and frozen shared blocks |
 | `APPEND_COMPACT_CACHE_MAX_FILES` | `4096` | Memo entries kept; oldest are pruned first |
 | `APPEND_COMPACT_SHARED_CHARS` | `9000` | Default cap for `--emit-shared-block` |
 | `APPEND_COMPACT_DEBUG` | off | Also write errors to stderr |
 | `APPEND_COMPACT_LOG` | `~/.cache/append-compactor/error.log` | Error log path (rotated at 5 MB) |
+| `APPEND_COMPACT_JOB_LOG` | `~/.cache/append-compactor/jobs.log` | Per-job JSONL log path (rotated at 5 MB to `.1`); contains no turn text |
 | `OPENROUTER_EXTRA_HEADERS` | unset | JSON object or `Key: Value, ...` list emitted under `metadata.openrouter_extra_headers` for a custom gateway; inert in direct setups |
 
 ---

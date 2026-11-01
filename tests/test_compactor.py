@@ -15,6 +15,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import types
 from argparse import Namespace
 from pathlib import Path
@@ -50,12 +51,16 @@ def isolated_environment(tmp_path, monkeypatch):
     """Keep logs and compressor globals test-local."""
     monkeypatch.setenv("APPEND_COMPACT_LOG", str(tmp_path / "error.log"))
     monkeypatch.setenv("APPEND_COMPACT_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("APPEND_COMPACT_JOB_LOG", str(tmp_path / "jobs.log"))
     monkeypatch.setenv("APPEND_COMPACT_BACKGROUND", "0")
     monkeypatch.delenv("APPEND_COMPACT_WORKER", raising=False)
     monkeypatch.delenv("APPEND_COMPACT_WORKERS", raising=False)
     monkeypatch.delenv("APPEND_COMPACT_DRAIN_WAIT", raising=False)
     monkeypatch.delenv("APPEND_COMPACT_LLM", raising=False)
     monkeypatch.delenv("APPEND_COMPACT_CACHE", raising=False)
+    monkeypatch.delenv("APPEND_COMPACT_DEDUPE", raising=False)
+    monkeypatch.delenv("APPEND_COMPACT_DEDUPE_WINDOW", raising=False)
+    monkeypatch.delenv("APPEND_COMPACT_CAPTURE_DEDUPE_SECONDS", raising=False)
     monkeypatch.delenv("OPENROUTER_EXTRA_HEADERS", raising=False)
     monkeypatch.setattr(compactor, "_compressor", None)
     monkeypatch.setattr(compactor, "_compressor_failed", False)
@@ -1118,3 +1123,281 @@ def test_precompact_dedupes_queued_turns(tmp_path, monkeypatch):
     assert compactor.pending_count(state, "s") == 2
     compactor.handle_precompact_event(state, payload, args, background=True)
     assert compactor.pending_count(state, "s") == 2
+
+
+# ---------------------------------------------------------------------------
+# Cross-source capture dedupe
+# ---------------------------------------------------------------------------
+
+DEDUPE_PROMPT = (
+    "Please inspect src/dedupe.py and update buildWidget so the retry loop closes "
+    "every connection, logs one concise message, and returns the collected results "
+    "to the caller without repeating expensive checks in the hot path."
+)
+
+
+def _precompact(text: str, role: str = "user") -> str:
+    return f"{role.capitalize()}:\n{text}"
+
+
+def _job_log_lines() -> list[dict]:
+    path = Path(os.environ["APPEND_COMPACT_JOB_LOG"])
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+
+
+def test_capture_key_strips_precompact_role_but_preserves_indentation():
+    assert compactor._capture_key(_precompact(DEDUPE_PROMPT), strip_role=True) == compactor._capture_key(
+        DEDUPE_PROMPT
+    )
+    assert compactor._capture_key("if ready:\n    run()\n") != compactor._capture_key(
+        "if ready:\nrun()\n"
+    )
+    assert compactor._capture_key(DEDUPE_PROMPT + "  \n\n\n") == compactor._capture_key(DEDUPE_PROMPT)
+
+
+def test_precompact_then_prompt_dedupes_one_capture():
+    state = _fresh_state()
+    first = compactor.queue_or_append(
+        state, _precompact(DEDUPE_PROMPT), "precompact", "s", background=False, role="user"
+    )
+    assert first is not None
+    assert compactor.queue_or_append(
+        state, DEDUPE_PROMPT, "user_prompt", "s", background=False, role="user"
+    ) is None
+    assert len(state["l1_chunks"]) == 1
+    assert state["l1_chunks"][0]["role"] == "user"
+    assert state["l1_chunks"][0]["capture_key"] == compactor._capture_key(
+        DEDUPE_PROMPT
+    )
+    assert state["prompt_seen"]["s"] > 0
+    events = _job_log_lines()
+    assert any(event["event"] == "dedupe" and event["reason"] == "capture_key" for event in events)
+    assert all(DEDUPE_PROMPT not in json.dumps(event) for event in events)
+
+
+def test_prompt_then_precompact_dedupes_the_other_direction():
+    state = _fresh_state()
+    assert compactor.queue_or_append(
+        state, DEDUPE_PROMPT, "user_prompt", "s", background=False, role="user"
+    ) is not None
+    assert compactor.queue_or_append(
+        state, _precompact(DEDUPE_PROMPT), "precompact", "s", background=False, role="user"
+    ) is None
+    assert len(state["l1_chunks"]) == 1
+
+
+def test_dedupe_is_scoped_by_session_role_and_source():
+    state = _fresh_state()
+    compactor.queue_or_append(
+        state, _precompact(DEDUPE_PROMPT), "precompact", "A", background=False, role="user"
+    )
+    # A parallel session's identical text is its own turn.
+    assert compactor.queue_or_append(
+        state, DEDUPE_PROMPT, "user_prompt", "B", background=False, role="user"
+    ) is not None
+    # An assistant turn is never suppressed by a user capture.
+    assert compactor.queue_or_append(
+        state, _precompact(DEDUPE_PROMPT, "assistant"), "precompact", "A", background=False,
+        role="assistant",
+    ) is not None
+    # Prompt-vs-prompt is deliberately not fuzzy-deduped.
+    assert compactor.queue_or_append(
+        state, DEDUPE_PROMPT, "user_prompt", "C", background=False, role="user"
+    ) is not None
+    assert compactor.queue_or_append(
+        state, DEDUPE_PROMPT, "user_prompt", "C", background=False, role="user"
+    ) is not None
+    assert len(state["l1_chunks"]) == 5
+
+
+def test_prompt_seen_floor_keeps_a_deliberate_retry():
+    state = _fresh_state()
+    compactor.queue_or_append(
+        state, _precompact(DEDUPE_PROMPT), "precompact", "s", background=False, role="user"
+    )
+    assert compactor.queue_or_append(
+        state, DEDUPE_PROMPT, "user_prompt", "s", background=False, role="user"
+    ) is None
+    retry = compactor.queue_or_append(
+        state, DEDUPE_PROMPT, "user_prompt", "s", background=False, role="user"
+    )
+    assert retry is not None
+    assert len(state["l1_chunks"]) == 2
+
+
+def test_prompt_dedupe_respects_the_capture_age_window():
+    state = _fresh_state()
+    compactor.queue_or_append(
+        state, _precompact(DEDUPE_PROMPT), "precompact", "s", background=False, role="user"
+    )
+    old = time.time() - 200
+    state["l1_chunks"][0]["created_at"] = old
+    state["recent_captures"][0]["at"] = old
+    assert compactor.queue_or_append(
+        state, DEDUPE_PROMPT, "user_prompt", "s", background=False, role="user"
+    ) is not None
+    assert len(state["l1_chunks"]) == 2
+
+
+def test_queue_cap_fallback_still_refuses_a_duplicate(monkeypatch):
+    monkeypatch.setenv("APPEND_COMPACT_MAX_PENDING_TOTAL", "1")
+    state = _fresh_state()
+    compactor.queue_or_append(
+        state, _precompact(DEDUPE_PROMPT), "precompact", "s", background=False, role="user"
+    )
+    # Fill the machine-wide queue without touching this session's prompt floor.
+    assert compactor.enqueue_turn(state, "fill the queue src/fill.py", session="other") is not None
+    assert compactor.pending_count(state) == 1
+    assert compactor.queue_or_append(
+        state, DEDUPE_PROMPT, "user_prompt", "s", background=True, role="user"
+    ) is None
+    assert len(state["l1_chunks"]) == 1
+    assert compactor.pending_count(state, "s") == 0
+
+
+def test_similarity_gate_ignores_injected_system_reminders():
+    state = _fresh_state()
+    wrapped = _precompact(
+        "<system-reminder>injected hook context</system-reminder>\n" + DEDUPE_PROMPT
+    )
+    assert compactor.queue_or_append(
+        state, wrapped, "precompact", "s", background=False, role="user"
+    ) is not None
+    assert compactor.queue_or_append(
+        state, DEDUPE_PROMPT, "user_prompt", "s", background=False, role="user"
+    ) is None
+    assert len(state["l1_chunks"]) == 1
+    events = _job_log_lines()
+    assert any(event["event"] == "dedupe" and event["reason"] == "substring" for event in events)
+
+
+def test_similarity_gate_keeps_unrelated_and_expanded_prompts():
+    state = _fresh_state()
+    compactor.queue_or_append(
+        state, _precompact(DEDUPE_PROMPT), "precompact", "s", background=False, role="user"
+    )
+    unrelated = (
+        "Audit the release checklist, rotate the signing keys, and document the rollback "
+        "procedure for the deployment pipeline before Friday's maintenance window."
+    )
+    assert compactor.queue_or_append(
+        state, unrelated, "user_prompt", "s", background=False, role="user"
+    ) is not None
+    expanded = DEDUPE_PROMPT + " Also update the documentation and changelog entries."
+    assert compactor.queue_or_append(
+        state, expanded, "user_prompt", "s", background=False, role="user"
+    ) is not None
+    assert len(state["l1_chunks"]) == 3
+
+
+def test_similarity_requires_minimum_evidence():
+    sim = compactor._capture_similarity("short prompt src/a.py", "short prompt src/a.py")
+    assert sim["evidence"] is False
+
+
+def test_recent_captures_are_bounded_and_age_pruned():
+    state = _fresh_state()
+    for index in range(70):
+        compactor._record_recent_capture(
+            state, f"prompt number {index} about src/module_{index}.py", "user_prompt", "user",
+            "s", now=1_000.0 + index,
+        )
+    assert len(state["recent_captures"]) == 64
+    assert state["recent_captures"][0]["text"].startswith("prompt number 6 ")
+    compactor._record_recent_capture(
+        state, "prompt after the window src/later.py", "user_prompt", "user", "s", now=2_000.0
+    )
+    assert len(state["recent_captures"]) == 1
+    assert state["recent_captures"][0]["text"].startswith("prompt after the window")
+
+
+def test_load_state_backfills_and_sanitizes_dedupe_fields(tmp_path):
+    good = {
+        "at": 1.0,
+        "text": "kept",
+        "source": "user_prompt",
+        "role": "user",
+        "session": "s",
+        "capture_key": "abc",
+    }
+    raw = {
+        "schema": 1,
+        "recent_captures": [good, {"at": "bad"}, {"at": 1, "text": "x", "source": "other", "role": "user"}],
+        "prompt_seen": {f"s{index}": index for index in range(300)},
+    }
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    loaded = compactor.load_state(path)
+    assert loaded["recent_captures"] == [good]
+    assert len(loaded["prompt_seen"]) == compactor.PROMPT_SEEN_LIMIT
+    assert "s0" not in loaded["prompt_seen"] and "s299" in loaded["prompt_seen"]
+
+
+def test_dedupe_kill_switch_preserves_legacy_precompact_dedupe(monkeypatch):
+    monkeypatch.setenv("APPEND_COMPACT_DEDUPE", "0")
+    state = _fresh_state()
+    compactor.queue_or_append(
+        state, _precompact(DEDUPE_PROMPT), "precompact", "s", background=False, role="user"
+    )
+    assert compactor.queue_or_append(
+        state, DEDUPE_PROMPT, "user_prompt", "s", background=False, role="user"
+    ) is not None
+    assert compactor.queue_or_append(
+        state, _precompact(DEDUPE_PROMPT), "precompact", "s", background=False, role="user"
+    ) is None
+    assert len(state["l1_chunks"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# Error heuristic and job log
+# ---------------------------------------------------------------------------
+
+def test_error_heuristic_matches_logs_but_not_prose():
+    assert compactor._ERROR_RE.search("The error message was long and the retry failed.") is None
+    assert compactor._ERROR_RE.search("the exception path is documented") is None
+    for text in ("error: disk full", "ERROR! bad token", "Traceback (most recent call last):",
+                 "panic: runtime error", "npm ERR! missing script"):
+        assert compactor._ERROR_RE.search(text), text
+
+
+def test_job_log_records_enqueue_and_is_text_free():
+    state = _fresh_state()
+    job = compactor.enqueue_turn(state, DEDUPE_PROMPT, session="s", role="user")
+    assert job is not None
+    events = _job_log_lines()
+    enqueued = [event for event in events if event["event"] == "enqueue"]
+    assert len(enqueued) == 1
+    assert enqueued[0]["job_id"] == job["id"]
+    assert enqueued[0]["source"] == "user_prompt"
+    assert enqueued[0]["role"] == "user"
+    assert enqueued[0]["bytes"] == len(DEDUPE_PROMPT)
+    assert all(DEDUPE_PROMPT not in json.dumps(event) for event in events)
+
+
+def test_worker_logs_commits_and_continues_after_a_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("APPEND_COMPACT_LLM", "0")
+    monkeypatch.setenv("APPEND_COMPACT_WORKER_IDLE", "1")
+    state_path = tmp_path / "state.json"
+    state = _fresh_state()
+    compactor.enqueue_turn(state, "boom src/fail.py", session="s", role="user")
+    compactor.enqueue_turn(state, "good src/good.py", session="s", role="user")
+    compactor.save_state(state, state_path)
+
+    real_compress = compactor.compress_text
+
+    def flaky(text, llm="auto"):
+        if "boom" in text:
+            raise RuntimeError("simulated failure")
+        return real_compress(text, llm="off")
+
+    monkeypatch.setattr(compactor, "compress_text", flaky)
+    assert compactor.worker_main(state_path) == 0
+    events = _job_log_lines()
+    assert any(event["event"] == "error" for event in events)
+    assert any(event["event"] == "commit" for event in events)
+    assert all("boom src/fail.py" not in json.dumps(event) for event in events)
+    reloaded = compactor.load_state(state_path)
+    assert len(reloaded["l1_chunks"]) == 1
+    assert "src/good.py" in reloaded["l1_chunks"][0]["compressed_text"]

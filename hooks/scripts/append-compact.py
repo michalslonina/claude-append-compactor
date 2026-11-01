@@ -36,7 +36,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import uuid
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -47,7 +49,7 @@ except ImportError:  # pragma: no cover - Windows fallback
     fcntl = None  # type: ignore[assignment]
 
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 SCHEMA_VERSION = 1
 PLUGIN_NAME = "claude-append-compactor"
 
@@ -97,6 +99,21 @@ DEFAULT_MAX_PENDING_TOTAL = 64
 DEFAULT_DRAIN_WAIT_SECONDS = 5
 PENDING_MAX_CHARS = 24_000
 PENDING_TEXT_HEADER = "raw"
+
+# Cross-source capture dedupe.  A PreCompact capture prefixes the turn with a
+# role label while UserPromptSubmit does not, so the raw hashes never match.
+DEFAULT_DEDUPE_WINDOW_SECONDS = 900
+DEFAULT_CAPTURE_DEDUPE_SECONDS = 120
+RECENT_CAPTURE_LIMIT = 64
+PROMPT_SEEN_LIMIT = 256
+DEDUPE_MIN_TOKENS = 20
+DEDUPE_MIN_SHINGLES = 8
+DEDUPE_SHINGLE_WORDS = 5
+DEDUPE_CONTAINMENT = 0.95
+DEDUPE_TOKEN_CONTAINMENT = 0.98
+DEDUPE_JACCARD = 0.90
+DEDUPE_LENGTH_RATIO = 0.8
+JOBS_LOG_MAX_BYTES = 5 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +165,33 @@ def _log_error(message: str) -> None:
         pass
     if _env_bool("APPEND_COMPACT_DEBUG", False):
         print(f"[append-compact] {message}", file=sys.stderr)
+
+
+def _job_log_path() -> Path:
+    configured = os.environ.get("APPEND_COMPACT_JOB_LOG")
+    if configured and configured.strip():
+        return Path(configured).expanduser()
+    return default_cache_dir() / "jobs.log"
+
+
+def _log_job(event: str, **fields: Any) -> None:
+    """Append one JSONL job event; never raise and never log raw turn text."""
+    try:
+        path = _job_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size > JOBS_LOG_MAX_BYTES:
+            with contextlib.suppress(OSError):
+                path.replace(path.with_name(path.name + ".1"))
+        record: dict[str, Any] = {"at": _now(), "ts": round(time.time(), 3), "event": event}
+        record.update(fields)
+        line = json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, line.encode("utf-8"))
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
 
 
 @contextlib.contextmanager
@@ -272,6 +316,8 @@ def new_state() -> dict[str, Any]:
         "l2_masters": [],
         "pending": [],
         "armed_sessions": {},
+        "recent_captures": [],
+        "prompt_seen": {},
         "stats": {
             "turns": 0,
             "bytes_in": 0,
@@ -310,9 +356,38 @@ def load_state(path: Path | None = None) -> dict[str, Any]:
             data[key] = []
     if not isinstance(data.get("armed_sessions"), dict):
         data["armed_sessions"] = {}
+    recent = data.get("recent_captures")
+    if not isinstance(recent, list):
+        recent = []
+    data["recent_captures"] = [
+        entry
+        for entry in recent
+        if isinstance(entry, dict)
+        and isinstance(entry.get("at"), (int, float))
+        and isinstance(entry.get("text"), str)
+        and entry.get("source") in ("precompact", "user_prompt")
+        and entry.get("role") == "user"
+    ][-RECENT_CAPTURE_LIMIT:]
+    prompt_seen = data.get("prompt_seen")
+    if not isinstance(prompt_seen, dict):
+        prompt_seen = {}
+    data["prompt_seen"] = {
+        str(key): float(value)
+        for key, value in prompt_seen.items()
+        if isinstance(value, (int, float))
+    }
+    _cap_prompt_seen(data)
     if not isinstance(data.get("stats"), dict):
         data["stats"] = base["stats"]
     return data
+
+
+def _cap_prompt_seen(state: dict[str, Any]) -> None:
+    seen = state.get("prompt_seen")
+    if not isinstance(seen, dict) or len(seen) <= PROMPT_SEEN_LIMIT:
+        return
+    ordered = sorted(seen.items(), key=lambda item: float(item[1]))
+    state["prompt_seen"] = dict(ordered[-PROMPT_SEEN_LIMIT:])
 
 
 def save_state(state: dict[str, Any], path: Path | None = None) -> None:
@@ -511,10 +586,11 @@ _EMPTY_IMPORT_RE = re.compile(
 )
 
 _ERROR_RE = re.compile(
-    r"(?im)(?:^|\b)(?:"
+    r"(?im)(?:"
     r"traceback \(most recent call last\)|fatal error|panic:|syntaxerror|typeerror|"
     r"referenceerror|valueerror|modulenotfounderror|importerror|failed to|npm err!|"
-    r"error ts\d+|\berror\b|\bexception\b|segmentation fault|core dumped"
+    r"error ts\d+|segmentation fault|core dumped"
+    r"|^\s*(?:error|exception)\s*[:!]"
     r")"
 )
 
@@ -919,6 +995,259 @@ def _normalize_prose(text: str) -> str:
     return "\n".join(out).strip("\n")
 
 
+# ---------------------------------------------------------------------------
+# Cross-source capture dedupe
+# ---------------------------------------------------------------------------
+
+_ROLE_PREFIX_RE = re.compile(
+    r"^\s*(?:user|assistant|system|human|tool|claude)\s*:\s*", re.IGNORECASE
+)
+_SYSTEM_REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.IGNORECASE | re.DOTALL)
+
+
+def _dedupe_enabled() -> bool:
+    return _env_bool("APPEND_COMPACT_DEDUPE", True)
+
+
+def _capture_key(text: str, *, strip_role: bool = False) -> str:
+    """Durable exact-identity key; role labels are stripped only for PreCompact.
+
+    Raw prompts are hashed as typed.  ``_normalize_prose`` preserves line
+    breaks and indentation, so a code block with changed indentation cannot
+    collapse onto another capture.
+    """
+    body = _ROLE_PREFIX_RE.sub("", text, count=1) if strip_role else text
+    return hashlib.sha256(_normalize_prose(body).encode("utf-8")).hexdigest()[:32]
+
+
+def _similarity_text(text: str) -> str:
+    """Comparison-only normalization: reminders and role labels removed."""
+    body = _SYSTEM_REMINDER_RE.sub(" ", text)
+    body = _ROLE_PREFIX_RE.sub("", body, count=1)
+    body = unicodedata.normalize("NFKC", body).casefold()
+    return re.sub(r"\s+", " ", body).strip()
+
+
+def _word_shingles(tokens: list[str]) -> set[int]:
+    size = DEDUPE_SHINGLE_WORDS
+    return {
+        zlib.crc32(" ".join(tokens[index:index + size]).encode("utf-8"))
+        for index in range(max(0, len(tokens) - size + 1))
+    }
+
+
+def _ratio(numerator: int, denominator: int) -> float:
+    return numerator / denominator if denominator else 0.0
+
+
+def _capture_similarity(a: str, b: str) -> dict[str, float | bool]:
+    """Token/shingle containment and Jaccard for two normalized texts."""
+    tokens_a = re.findall(r"\w+", a)
+    tokens_b = re.findall(r"\w+", b)
+    set_a, set_b = set(tokens_a), set(tokens_b)
+    shingle_a, shingle_b = _word_shingles(tokens_a), _word_shingles(tokens_b)
+    shared_tokens, shared_shingles = len(set_a & set_b), len(shingle_a & shingle_b)
+    length_ratio = _ratio(len(a), len(b))
+    evidence = (
+        min(len(tokens_a), len(tokens_b)) >= DEDUPE_MIN_TOKENS
+        and min(len(shingle_a), len(shingle_b)) >= DEDUPE_MIN_SHINGLES
+    )
+    return {
+        "evidence": evidence,
+        "token_containment_a": _ratio(shared_tokens, len(set_a)),
+        "token_containment_b": _ratio(shared_tokens, len(set_b)),
+        "token_jaccard": _ratio(shared_tokens, len(set_a | set_b)),
+        "shingle_containment_a": _ratio(shared_shingles, len(shingle_a)),
+        "shingle_containment_b": _ratio(shared_shingles, len(shingle_b)),
+        "shingle_jaccard": _ratio(shared_shingles, len(shingle_a | shingle_b)),
+        "substring_ab": bool(a) and a in b,
+        "substring_ba": bool(b) and b in a,
+        "length_ratio": length_ratio,
+    }
+
+
+def _record_recent_capture(
+    state: dict[str, Any],
+    text: str,
+    source: str,
+    role: str | None,
+    session: str | None,
+    now: float | None = None,
+) -> None:
+    """Remember a user capture for fuzzy matching; bounded by age and count."""
+    if role != "user" or source not in ("precompact", "user_prompt"):
+        return
+    normalized = _similarity_text(text)
+    if not normalized:
+        return
+    now = time.time() if now is None else now
+    window = _env_int("APPEND_COMPACT_DEDUPE_WINDOW", DEFAULT_DEDUPE_WINDOW_SECONDS)
+    tokens = re.findall(r"\w+", normalized)
+    entry = {
+        "capture_key": _capture_key(text, strip_role=source == "precompact"),
+        "source": source,
+        "role": role,
+        "session": session,
+        "at": now,
+        "text": normalized[:PENDING_MAX_CHARS],
+        "tokens": len(tokens),
+        "shingles": len(_word_shingles(tokens)),
+    }
+    recent = state.setdefault("recent_captures", [])
+    kept: list[dict[str, Any]] = []
+    for item in recent:
+        if not isinstance(item, dict):
+            continue
+        at = item.get("at")
+        if not isinstance(at, (int, float)):
+            continue
+        if now - float(at) > window:
+            continue
+        kept.append(item)
+    kept.append(entry)
+    state["recent_captures"] = kept[-RECENT_CAPTURE_LIMIT:]
+
+
+def _record_prompt_seen(state: dict[str, Any], session: str | None, now: float) -> None:
+    if session is None:
+        return
+    seen = state.setdefault("prompt_seen", {})
+    seen[session] = now
+    _cap_prompt_seen(state)
+
+
+def _age(entry: dict[str, Any], now: float) -> float | None:
+    at = entry.get("created_at", entry.get("at"))
+    if not isinstance(at, (int, float)):
+        return None
+    return now - float(at)
+
+
+def _find_duplicate_capture(
+    state: dict[str, Any],
+    text: str,
+    source: str,
+    role: str | None,
+    session: str | None,
+    now: float | None = None,
+) -> bool:
+    """Return True when this capture is already covered by another source.
+
+    The durable key is checked first; a bounded similarity gate catches
+    injected wrappers.  Rules are directional so a prompt that merely overlaps
+    an old capture, or adds instructions to one, is never dropped.
+    """
+    if not _dedupe_enabled() or role not in ("user", "assistant", "tool"):
+        return False
+    if source not in ("precompact", "user_prompt"):
+        return False
+    now = time.time() if now is None else now
+    strip_role = source == "precompact"
+    key = _capture_key(text, strip_role=strip_role)
+    input_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
+    sources = ("precompact", "user_prompt") if source == "precompact" else ("precompact",)
+    window = _env_int("APPEND_COMPACT_DEDUPE_WINDOW", DEFAULT_DEDUPE_WINDOW_SECONDS)
+    prompt_window = _env_int("APPEND_COMPACT_CAPTURE_DEDUPE_SECONDS", DEFAULT_CAPTURE_DEDUPE_SECONDS)
+    since: float | None = None
+    max_age: float | None = None
+    if source == "user_prompt":
+        floor = state.get("prompt_seen", {}).get(session)
+        if isinstance(floor, (int, float)):
+            since = float(floor)
+        max_age = float(prompt_window)
+
+    match = _find_captured_entry(
+        state,
+        input_sha,
+        session,
+        capture_key=key,
+        sources=sources,
+        role=role,
+        since=since,
+        max_age=max_age,
+        now=now,
+    )
+    if match is not None:
+        _log_job(
+            "dedupe",
+            source=source,
+            role=role,
+            session=session,
+            reason="capture_key" if match.get("capture_key") == key else "input_sha",
+            matched_source=match.get("source"),
+            matched_role=match.get("role"),
+            matched_n=match.get("n"),
+            capture_key=key[:12],
+        )
+        return True
+
+    current = _similarity_text(text)
+    if not current:
+        return False
+    counterpart = "user_prompt" if source == "precompact" else "precompact"
+    for entry in reversed(state.get("recent_captures", [])):
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("session") != session or entry.get("role") != "user":
+            continue
+        if entry.get("source") != counterpart:
+            continue
+        candidate = entry.get("text")
+        at = entry.get("at")
+        if not isinstance(candidate, str) or not isinstance(at, (int, float)):
+            continue
+        age = now - float(at)
+        if age < -5 or age > window:
+            continue
+        if source == "user_prompt":
+            if since is not None and float(at) < since:
+                continue
+            if age > prompt_window:
+                continue
+        sim = _capture_similarity(current, candidate)
+        if not sim["evidence"]:
+            continue
+        if source == "precompact":
+            contained = bool(sim["substring_ba"]) or (
+                sim["shingle_containment_b"] >= DEDUPE_CONTAINMENT
+                and sim["token_containment_b"] >= DEDUPE_TOKEN_CONTAINMENT
+            )
+        else:
+            contained = bool(sim["substring_ab"]) or (
+                sim["shingle_containment_a"] >= DEDUPE_CONTAINMENT
+                and sim["token_containment_a"] >= DEDUPE_TOKEN_CONTAINMENT
+            )
+        # A prompt is never dropped merely for overlapping an old capture: it
+        # may add instructions.  Only containment in the prompt direction is
+        # safe; the symmetric Jaccard rule is PreCompact-only.
+        near_equal = (
+            source == "precompact"
+            and sim["shingle_jaccard"] >= DEDUPE_JACCARD
+            and sim["token_jaccard"] >= DEDUPE_JACCARD
+            and DEDUPE_LENGTH_RATIO <= sim["length_ratio"] <= 1 / DEDUPE_LENGTH_RATIO
+        )
+        if contained or near_equal:
+            _log_job(
+                "dedupe",
+                source=source,
+                role=role,
+                session=session,
+                reason="substring" if (sim["substring_ba"] if source == "precompact" else sim["substring_ab"]) else (
+                    "shingle" if contained else "jaccard"
+                ),
+                matched_source=entry.get("source"),
+                matched_role=entry.get("role"),
+                matched_age=round(age, 3),
+                shingle_containment=round(float(sim["shingle_containment_b"] if source == "precompact" else sim["shingle_containment_a"]), 4),
+                token_containment=round(float(sim["token_containment_b"] if source == "precompact" else sim["token_containment_a"]), 4),
+                shingle_jaccard=round(float(sim["shingle_jaccard"]), 4),
+                token_jaccard=round(float(sim["token_jaccard"]), 4),
+                capture_key=key[:12],
+            )
+            return True
+    return False
+
+
 def _looks_like_prose(text: str) -> bool:
     if not re.search(r"[A-Za-z]{3,}", text):
         return False
@@ -1177,6 +1506,8 @@ def append_turn(
     source: str = "user_prompt",
     llm: Any = "auto",
     session: str | None = None,
+    role: str | None = None,
+    capture_key: str | None = None,
 ) -> dict[str, Any] | None:
     """Compress one turn and append it as an immutable L1 chunk."""
     if not text or not text.strip():
@@ -1187,18 +1518,24 @@ def append_turn(
 
     number = max((int(chunk.get("n", 0)) for chunk in state.get("l1_chunks", [])), default=0) + 1
     entities = _merge_entities(extract_entities(text), extract_entities(compressed))
+    key = capture_key or _capture_key(text, strip_role=source == "precompact")
+    captured_at = time.time()
     chunk = {
         "n": number,
         "created": _now(),
+        "created_at": captured_at,
         "source": source,
+        "role": role,
         "session": session,
         "input_sha": hashlib.sha256(text.encode("utf-8")).hexdigest()[:32],
+        "capture_key": key,
         "entities": entities,
         "compressed_text": compressed,
         "block": _chunk_block(number, entities, compressed, source),
         "stats": stats,
     }
     state.setdefault("l1_chunks", []).append(chunk)
+    _record_recent_capture(state, text, source, role, session, captured_at)
 
     totals = state.setdefault("stats", {})
     totals["turns"] = int(totals.get("turns", 0)) + 1
@@ -1225,14 +1562,50 @@ def pending_count(state: dict[str, Any], session: str | None = None) -> int:
     return len(_pending_for(state, session))
 
 
+def _find_captured_entry(
+    state: dict[str, Any],
+    input_sha: str | None,
+    session: str | None,
+    *,
+    capture_key: str | None = None,
+    sources: tuple[str, ...] | None = None,
+    role: str | None = None,
+    since: float | None = None,
+    max_age: float | None = None,
+    now: float | None = None,
+) -> dict[str, Any] | None:
+    """Find a pending job or committed chunk that already covers this capture."""
+    allowed = set(sources or ("precompact",))
+    now = time.time() if now is None else now
+    for collection in ("pending", "l1_chunks"):
+        for item in state.get(collection, []):
+            if not isinstance(item, dict) or not _belongs(item, session):
+                continue
+            if item.get("source") not in allowed:
+                continue
+            if role is not None and item.get("role") not in (role, None):
+                continue
+            if since is not None or max_age is not None:
+                at = item.get("created_at")
+                if not isinstance(at, (int, float)):
+                    continue
+                at = float(at)
+                if at > now + 5:
+                    continue
+                if since is not None and at < since:
+                    continue
+                if max_age is not None and now - at > max_age:
+                    continue
+            if capture_key and item.get("capture_key") == capture_key:
+                return item
+            if input_sha and item.get("input_sha") == input_sha:
+                return item
+    return None
+
+
 def _already_captured(state: dict[str, Any], input_sha: str, session: str | None) -> bool:
-    for job in state.get("pending", []):
-        if _belongs(job, session) and job.get("source") == "precompact" and job.get("input_sha") == input_sha:
-            return True
-    for chunk in state.get("l1_chunks", []):
-        if _belongs(chunk, session) and chunk.get("source") == "precompact" and chunk.get("input_sha") == input_sha:
-            return True
-    return False
+    """Legacy exact PreCompact dedupe used by direct callers and the kill switch."""
+    return _find_captured_entry(state, input_sha, session, sources=("precompact",)) is not None
 
 
 def enqueue_turn(
@@ -1241,6 +1614,8 @@ def enqueue_turn(
     source: str = "user_prompt",
     session: str | None = None,
     dedupe: bool = False,
+    role: str | None = None,
+    capture_key: str | None = None,
 ) -> dict[str, Any] | None:
     """Queue a raw turn for a background worker; returns the (saved) job."""
     if not text or not text.strip():
@@ -1248,19 +1623,33 @@ def enqueue_turn(
     input_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
     if dedupe and _already_captured(state, input_sha, session):
         return None
+    key = capture_key or _capture_key(text, strip_role=source == "precompact")
     job = {
         "id": uuid.uuid4().hex,
         "session": session,
         "source": source,
+        "role": role,
         "created": _now(),
         "created_at": time.time(),
         "status": "pending",
         "input_sha": input_sha,
+        "capture_key": key,
         "entities": extract_entities(text),
         "text": text[:PENDING_MAX_CHARS],
     }
     state.setdefault("pending", []).append(job)
+    _record_recent_capture(state, text, source, role, session, float(job["created_at"]))
+    _log_job(
+        "enqueue",
+        job_id=job["id"],
+        session=session,
+        source=source,
+        role=role,
+        bytes=len(text),
+        capture_key=key[:12],
+    )
     return job
+
 
 
 def queue_or_append(
@@ -1269,6 +1658,7 @@ def queue_or_append(
     source: str,
     session: str | None,
     background: bool,
+    role: str | None = None,
 ) -> dict[str, Any] | None:
     """Enqueue for background compression, or compress inline as a fallback.
 
@@ -1276,18 +1666,39 @@ def queue_or_append(
     full, blocking a hook on model work would make a busy swarm worse, not
     better.  With background disabled the old synchronous behaviour is kept.
     """
+    now = time.time()
     dedupe = source == "precompact"
+    if _dedupe_enabled() and role is not None:
+        duplicate = _find_duplicate_capture(state, text, source, role, session, now)
+    else:
+        duplicate = bool(
+            dedupe
+            and _already_captured(
+                state, hashlib.sha256(text.encode("utf-8")).hexdigest()[:32], session
+            )
+        )
+    if source == "user_prompt" and _dedupe_enabled() and role is not None:
+        # Advance the floor even when this prompt was absorbed: a deliberate
+        # identical retry must be captured as a new turn.
+        _record_prompt_seen(state, session, now)
+    if duplicate:
+        return None
+
     if background and _env_bool("APPEND_COMPACT_LLM", True):
         limit = _env_int("APPEND_COMPACT_MAX_PENDING", DEFAULT_MAX_PENDING)
         total_limit = _env_int("APPEND_COMPACT_MAX_PENDING_TOTAL", DEFAULT_MAX_PENDING_TOTAL)
         if pending_count(state, session) < limit and pending_count(state) < total_limit:
-            return enqueue_turn(state, text, source=source, session=session, dedupe=dedupe)
-        return append_turn(state, text, source=source, llm="off", session=session)
-    if dedupe and _already_captured(
-        state, hashlib.sha256(text.encode("utf-8")).hexdigest()[:32], session
-    ):
-        return None
-    return append_turn(state, text, source=source, session=session)
+            return enqueue_turn(state, text, source=source, session=session, role=role)
+        _log_job(
+            "inline",
+            session=session,
+            source=source,
+            role=role,
+            bytes=len(text),
+            reason="queue_full",
+        )
+        return append_turn(state, text, source=source, llm="off", session=session, role=role)
+    return append_turn(state, text, source=source, session=session, role=role)
 
 
 def _requeue_stale(state: dict[str, Any], now: float) -> bool:
@@ -1351,16 +1762,21 @@ def commit_job(
     session = entry.get("session")
     number = max((int(chunk.get("n", 0)) for chunk in state.get("l1_chunks", [])), default=0) + 1
     entities = _merge_entities(extract_entities(entry.get("text", "")), extract_entities(compressed))
+    source = entry.get("source", "user_prompt")
     chunk = {
         "n": number,
         "created": _now(),
-        "source": entry.get("source", "user_prompt"),
+        "created_at": entry.get("created_at") if isinstance(entry.get("created_at"), (int, float)) else time.time(),
+        "source": source,
+        "role": entry.get("role"),
         "session": session,
         "input_sha": entry.get("input_sha")
         or hashlib.sha256(str(entry.get("text", "")).encode("utf-8")).hexdigest()[:32],
+        "capture_key": entry.get("capture_key")
+        or _capture_key(str(entry.get("text", "")), strip_role=source == "precompact"),
         "entities": entities,
         "compressed_text": compressed,
-        "block": _chunk_block(number, entities, compressed, entry.get("source", "")),
+        "block": _chunk_block(number, entities, compressed, source),
         "stats": stats,
     }
     state.setdefault("l1_chunks", []).append(chunk)
@@ -1536,14 +1952,52 @@ def worker_main(state_path: Path) -> int:
                 time.sleep(0.5)
                 continue
             _heartbeat(worker, jobs_done, started, "working")
-            compressed, stats = compress_text(job["text"], llm="auto")
-            with state_lock(state_path):
-                state = load_state(state_path)
-                commit_job(state, str(job.get("id")), compressed, stats, worker=worker)
-                save_state(state, state_path)
-            jobs_done += 1
-            last_job = time.time()
-            _heartbeat(worker, jobs_done, started, "idle")
+            job_id = str(job.get("id"))
+            job_source = job.get("source")
+            job_session = job.get("session")
+            job_started = time.time()
+            try:
+                compressed, stats = compress_text(job["text"], llm="auto")
+                chunk = None
+                with state_lock(state_path):
+                    state = load_state(state_path)
+                    chunk = commit_job(state, job_id, compressed, stats, worker=worker)
+                    save_state(state, state_path)
+                duration = round(time.time() - job_started, 3)
+                if chunk is None:
+                    _log_job(
+                        "dropped",
+                        job_id=job_id,
+                        worker=worker,
+                        source=job_source,
+                        session=job_session,
+                        duration=duration,
+                    )
+                else:
+                    jobs_done += 1
+                    _log_job(
+                        "commit",
+                        job_id=job_id,
+                        worker=worker,
+                        source=job_source,
+                        session=job_session,
+                        duration=duration,
+                        stats=stats,
+                    )
+            except Exception as exc:
+                _log_error(f"worker job {job_id} failed: {exc!r}")
+                _log_job(
+                    "error",
+                    job_id=job_id,
+                    worker=worker,
+                    source=job_source,
+                    session=job_session,
+                    duration=round(time.time() - job_started, 3),
+                    error=type(exc).__name__,
+                )
+            finally:
+                last_job = time.time()
+                _heartbeat(worker, jobs_done, started, "idle")
         return 0
     finally:
         with contextlib.suppress(OSError):
@@ -2048,7 +2502,7 @@ def handle_prompt_event(
         # session's chunks are eligible.
         output = injection_payload(state, session=session)
 
-    queue_or_append(state, prompt, "user_prompt", session, background)
+    queue_or_append(state, prompt, "user_prompt", session, background, role="user")
 
     if armed:
         state.get("armed_sessions", {}).pop(session, None)
@@ -2103,7 +2557,14 @@ def handle_precompact_event(
     max_chars = _env_int("APPEND_COMPACT_PRECOMPACT_CHARS", DEFAULT_PRECOMPACT_CHARS)
     turns = _read_transcript_turns(payload.get("transcript_path"), max_turns, max_chars)
     for role, text in turns:
-        queue_or_append(state, f"{role.capitalize()}:\n{text}", "precompact", session, background)
+        queue_or_append(
+            state,
+            f"{role.capitalize()}:\n{text}",
+            "precompact",
+            session,
+            background,
+            role=role,
+        )
 
     state.setdefault("armed_sessions", {})[session] = {
         "armed": True,
