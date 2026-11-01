@@ -293,7 +293,7 @@ across regenerations.
 
 `session`, `input_sha`, `role`, `capture_key`, `created_at`, `recent_captures`,
 `prompt_seen` and `pending` are additive optional fields; the schema number
-stays `1`, and older readers ignore them. Three compatibility rules apply:
+stays `1`, and older readers ignore them. Four compatibility rules apply:
 
 - A chunk, master or job **without** a `session` (written by ≤ 1.4) is treated
   as belonging to no session and is skipped by scoped injection. It remains in
