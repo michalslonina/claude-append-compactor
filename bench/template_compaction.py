@@ -2702,6 +2702,43 @@ def run_controls(
     return controls
 
 
+def _scope_note(scenarios: list[dict[str, Any]], depths: tuple[int, ...]) -> str:
+    """Describe the scope this run actually had.
+
+    Derived rather than hardcoded: a fixed "4 of 6 scenarios" string was true
+    for the v8 run and false for the v9 run, which used all six -- the summary
+    would have repeated a claim about its own scope that nothing measured.
+    """
+    planned_scenarios = len(SCENARIOS)
+    planned_depths = (24, 60, 96)
+    parts = [
+        f"Planned design was {planned_scenarios} scenarios x depths "
+        f"{'/'.join(str(d) for d in planned_depths)}."
+    ]
+    deviations = []
+    if len(scenarios) < planned_scenarios:
+        deviations.append(f"{len(scenarios)} of {planned_scenarios} scenarios")
+    if tuple(depths) != planned_depths:
+        deviations.append(
+            f"depths {'/'.join(str(d) for d in depths)} instead of "
+            f"{'/'.join(str(d) for d in planned_depths)}"
+        )
+    if deviations:
+        parts.append(
+            "This run used "
+            + " and ".join(deviations)
+            + " — a reduction I made to fit available time, NOT a user-approved "
+            "scope change."
+        )
+    else:
+        parts.append("This run used the full planned scope.")
+    parts.append(
+        "Anchored templates are still built through an unmeasured 60-turn step; "
+        "the regen arm is measured at every measured depth."
+    )
+    return " ".join(parts)
+
+
 def write_summary(
     report: dict[str, Any], rows: list[dict[str, Any]], aggregates: dict[str, Any]
 ) -> None:
@@ -2833,11 +2870,12 @@ def write_summary(
             "- All dollar figures are list-price estimates of injection cost, not the "
             f"{PROVIDER} bill; this run did not record token usage."
         )
-    lines.append(
-        "- Runtime reduction: 4 of 6 planned scenarios and 2 of 3 planned depths "
-        "(24, 96) were run; anchored generation still passed through the unmeasured "
-        "60-turn step. See settings.runtime_reduction in the JSON."
-    )
+    # Derived, never asserted: the v8 run used 4 of 6 scenarios and this line
+    # hardcoded that, so the v9 run that used all six still claimed "4 of 6" --
+    # a false statement in its own summary. See _scope_note.
+    scope = (report.get("settings") or {}).get("runtime_reduction") or ""
+    if scope:
+        lines.append(f"- Scope: {scope}")
     lines.append(
         "- All decisive facts sit in turns 1-20 so the 24-turn variant is complete; "
         "the 96-turn variant tests retention over a long distraction tail, not "
@@ -3072,13 +3110,7 @@ def main(argv: list[str] | None = None) -> int:
             # accepts whatever structure the model produces. Results from a -1
             # run measured loose templates and must be reported as such.
             "template_coverage_min": COVERAGE_MIN,
-            "runtime_reduction": (
-                "Planned design was 6 scenarios x depths 24/60/96. This run used 4 "
-                "scenarios and 2 measured depths (24, 96) — a reduction I made to fit "
-                "available time, NOT a user-approved scope change. Anchored templates "
-                "are still built through an unmeasured 60-turn step; the regen arm is "
-                "measured at both measured depths."
-            ),
+            "runtime_reduction": _scope_note(scenarios, depths),
             "plugin_injection": {
                 "l3_target_chars": 6400,
                 "max_inject_chars": 9000,

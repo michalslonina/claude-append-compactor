@@ -91,13 +91,54 @@ def ceilings(report: dict) -> dict[str, float]:
     }
 
 
+def paired_from_rows(report: dict, baseline: str) -> dict:
+    """Paired differences of every arm against ``baseline``, computed from rows.
+
+    The results file precomputes differences against current_goals only, which
+    cannot answer "is the minimal template as good as the full one" -- that is a
+    comparison between two arms, neither of which is the baseline.
+    """
+    rows = report.get("rows") or []
+    cells: dict[tuple, dict[str, dict]] = {}
+    for row in rows:
+        arm = row.get("arm")
+        key = (row.get("scenario"), row.get("depth"))
+        if not arm or key[0] is None or key[1] is None:
+            continue
+        cells.setdefault(key, {})[arm] = row
+    diffs: dict[str, dict[str, list[float]]] = {}
+    for arm in sorted({row.get("arm") for row in rows if row.get("arm")}):
+        if arm == baseline:
+            continue
+        for cell in cells.values():
+            if arm not in cell or baseline not in cell:
+                continue
+            for metric in METRICS:
+                a, b = cell[arm].get(metric), cell[baseline].get(metric)
+                if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+                    diffs.setdefault(arm, {}).setdefault(metric, []).append(float(a) - float(b))
+    out: dict[str, dict] = {}
+    for arm, per_metric in diffs.items():
+        metrics = {}
+        for metric, values in per_metric.items():
+            metrics[metric] = {
+                "mean_diff": sum(values) / len(values),
+                "wins": sum(1 for v in values if v > 0),
+                "losses": sum(1 for v in values if v < 0),
+                "ties": sum(1 for v in values if v == 0),
+                "n": len(values),
+            }
+        out[arm] = {"baseline": baseline, "metrics": metrics}
+    return out
+
+
 def normalise(value: float, ceiling: float | None) -> float | None:
     if ceiling is None or ceiling <= 0:
         return None
     return value / ceiling
 
 
-def build(report: dict) -> list[str]:
+def build(report: dict, baseline: str = "current_goals") -> list[str]:
     lines: list[str] = []
     ceiling = ceilings(report)
     settings = report.get("settings") or {}
@@ -214,9 +255,11 @@ def build(report: dict) -> list[str]:
                 f"{stats.get('decision_correct', 0):.2f} |"
             )
     lines.append("")
-    lines.append("## Paired differences vs current_goals")
+    lines.append(f"## Paired differences vs {baseline}")
     lines.append("")
-    paired = report.get("paired_differences") or {}
+    # Prefer recomputing from the rows when a baseline is named: the stored
+    # block only ever compares against current_goals.
+    paired = paired_from_rows(report, baseline) or (report.get("paired_differences") or {})
     if not paired:
         lines.append("_No paired data._")
     for arm, data in paired.items():
@@ -297,6 +340,18 @@ def _controls_pass() -> bool:
     if "| real | 4 | 0.50 " not in text:
         print("[control FAIL] a populated arm row was not rendered with its value", file=sys.stderr)
         ok = False
+    # Pairing from rows: known-positive (a hand-computable difference) and
+    # known-negative (a cell missing one arm must not be counted at all).
+    rows = [
+        {"scenario": "s1", "depth": 24, "arm": "base", "fact_recall": 0.5},
+        {"scenario": "s1", "depth": 24, "arm": "treat", "fact_recall": 0.75},
+        {"scenario": "s2", "depth": 24, "arm": "base", "fact_recall": 0.5},
+        {"scenario": "s2", "depth": 96, "arm": "treat", "fact_recall": 0.5},
+    ]
+    paired = paired_from_rows({"rows": rows}, "base")["treat"]["metrics"]["fact_recall"]
+    if paired["mean_diff"] != 0.25 or paired["wins"] != 1 or paired["n"] != 1:
+        print(f"[control FAIL] pairing gave {paired}, want diff 0.25 over n=1", file=sys.stderr)
+        ok = False
     return ok
 
 
@@ -304,6 +359,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("results", type=Path)
     parser.add_argument("--out", type=Path, default=None)
+    parser.add_argument(
+        "--baseline",
+        default="current_goals",
+        help="arm the paired differences are computed against",
+    )
     args = parser.parse_args(argv)
 
     if not _controls_pass():
@@ -311,7 +371,7 @@ def main(argv: list[str] | None = None) -> int:
         return 3
 
     report = json.loads(args.results.read_text(encoding="utf-8"))
-    lines = build(report)
+    lines = build(report, baseline=args.baseline)
     text = "\n".join(lines) + "\n"
     if args.out:
         args.out.write_text(text, encoding="utf-8")
