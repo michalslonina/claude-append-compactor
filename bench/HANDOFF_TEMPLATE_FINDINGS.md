@@ -261,6 +261,77 @@ duplicates, recovered from turns the L3 index had demoted. So the section's
 value is bounded by how much the packing actually drops -- it is a recovery
 mechanism, not a summary.
 
+**Where the value actually lands (Result 6).** A model-in-the-loop probe finds
+the recovered *open ask* changes answers 6/6 against 0/6 without it, at the same
+character count as a content-free control. It also finds that the values, files
+and errors the handoff can recover are normally still visible in the entity
+ledger and the L3 index, so those sections are duplication in most sessions. The
+measured contribution of the shipped section is the open-asks section.
+
+## Result 6 — the handoff changes answers, but only its open-asks section (value probe)
+
+Every result above measures recall: is a fact present in the injected text. That is
+necessary and not sufficient. This probe puts the model in the loop and asks a
+question whose answer exists only in material the packing dropped. It runs the
+shipped code path (`append_turn` then `injection_payload` from
+`hooks/scripts/append-compact.py`), not a reimplementation; the script is
+`bench/handoff_value_probe.py`.
+
+Six scenarios, one 45-turn synthetic session each, 6400-char target, qwen2.5:7b,
+one call per (scenario, arm, fact). Five arms: `none` (no context, a guess
+detector), `off` (handoff disabled), `sham` (`off` plus the handoff's exact
+character count of irrelevant text), `on` (handoff enabled), `full` (every turn
+verbatim, the model's ceiling). The fact is planted in turn 42 of 45 — a user
+turn the L3 index demotes — and a canary fact sits in the last turn so every arm
+can be checked for basic retrieval.
+
+| arm | target recovered | canary | mean context chars |
+|---|--:|--:|--:|
+| `none` | **0/6** | 0/6 | 0 |
+| `off` | **0/6** | 6/6 | 1,864 |
+| `sham` | **0/6** | 6/6 | 2,006 |
+| `on` | **6/6** | 6/6 | 2,004 |
+| `full` | 6/6 | 6/6 | 4,503 |
+
+Six paired cells, **6 wins / 0 losses / 0 ties**, for **+140 characters**. The full
+transcript needs +2,639 to reach the same score. The sham arm has the same
+length as `on` and scores like `off`, so the gain is content, not context
+budget.
+
+**The honest limit: this only tests open asks.** The first version of the probe
+used numeric values and could not run. Measured directly against the packed
+view, a number, a path or an error code planted in a demoted turn is **still
+there** — the entity ledger pins `137 s`, `811 s`, `3.4.1` and `ENOSPC` as bare
+facts, and the L3 index line keeps `src/importer/quarry_loader.py`. Those six
+scenarios were invalid by the probe's own absence control, because the "off" arm
+already had the fact. So the value/files sections of the handoff duplicate what
+the ledger already pins — the same finding as the 8/8 duplicate bullets, one
+level down. A whole-sentence user instruction is the one thing the ledger cannot
+represent as a token and the handoff can recover, and that is what the six
+scenarios test.
+
+The off-arm answers show the failure mode clearly: the model scrapes a fragment
+of the demoted index line and answers with it (`"csv"` for `csv writer`,
+`"manifest"` for `manifest loader`, once `"migration"` — the word in every line).
+The `on` arm either names the component or quotes the recovered sentence back
+(`"Please add a retry cap to the importer before the migration."`), which is the
+handoff bullet being read rather than guessed.
+
+**What this does not settle.** One 7B model, n=6, one sample per cell, synthetic
+sessions, and questions that name the fact type. It does not show that a
+stronger model — which may already widen its search — gains the same; a
+strong-model arm was not run. Nor does it price the risk of a wrong bullet:
+every bullet here was a verbatim copy, and the pool of questions a user actually
+asks is wider than "what did I ask you to drop".
+
+Two controls earned their keep while building this. A filler label `Turn 12:`
+put the digit 12 in the injection and satisfied a numeric absence check for the
+wrong reason; filler is now digit-free. And with the first system prompt
+("if a value is not in the context, use null") the model answered null even on
+the *full transcript* — the null instruction suppressed retrieval along with
+guessing, and was replaced by a no-context arm, which catches guessing without
+costing recall.
+
 ## Threats to validity
 
 - Synthetic sessions, one small local model, one sample per cell. Paired, not a
