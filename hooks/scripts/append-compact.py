@@ -5276,6 +5276,8 @@ def _read_transcript_turns(path: str | None, max_turns: int, max_chars: int) -> 
                     continue
                 if not isinstance(record, dict) or record.get("isSidechain"):
                     continue
+                if record.get("type") not in ("user", "assistant"):
+                    continue
                 message = record.get("message") if isinstance(record.get("message"), dict) else {}
                 role = message.get("role") or record.get("type")
                 if role not in ("user", "assistant"):

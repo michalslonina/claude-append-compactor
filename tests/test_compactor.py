@@ -910,6 +910,21 @@ def _write_transcript(path: Path) -> None:
     path.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
 
 
+def test_transcript_reader_skips_api_request_copies(tmp_path):
+    transcript = tmp_path / "transcript.jsonl"
+    records = [
+        {"type": "user", "message": {"role": "user", "content": "Please fix src/app.ts"}},
+        {"type": "api-request-blob", "message": {"role": "user", "content": "Please fix src/app.ts"}},
+        {"type": "assistant", "message": {"role": "assistant", "content": "Fixing src/app.ts."}},
+        {"type": "api-request-blob", "message": {"role": "assistant", "content": "Fixing src/app.ts."}},
+    ]
+    transcript.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+
+    turns = compactor._read_transcript_turns(str(transcript), 24, 24_000)
+
+    assert turns == [("user", "Please fix src/app.ts"), ("assistant", "Fixing src/app.ts.")]
+
+
 def test_precompact_returns_plain_text_and_arms_session(tmp_path):
     transcript = tmp_path / "transcript.jsonl"
     _write_transcript(transcript)
