@@ -12,7 +12,9 @@ Artifacts are outside the repo: results and summaries live in
 | run | arms | scenarios | depths | model | controls |
 |---|---|---|--:|---|---|
 | v8 | 7 arms incl. `shuffled_template` | 4 | 24/96 | qwen2.5:7b | 55/55 |
-| v9 (this) | `full`, `current_goals`, `current_goals_template`, `template_minimal` | 6 | 24/96 | qwen2.5:7b | 77/77 |
+| v9 | `full`, `current_goals`, `current_goals_template`, `template_minimal` | 6 | 24/96 | qwen2.5:7b | 77/77 |
+| v10 | 11 arms: every section dropped once, plus anchors and a deterministic extractor | 6 | 24/96 | qwen2.5:7b | 77/77 |
+| v11 | `current_goals`, `template_minimal`, `template_det` | 6 | 24/96 | qwen2.5:7b | 89/89 |
 | v3 | template arms | 6 | 24/60/96 | deepseek-flash | 50/50 |
 
 `n` per arm is the row count — one deterministic call per (scenario, depth, arm)
@@ -77,21 +79,110 @@ amount of section reshuffling closes it.
 This also explains the v8 result that replacement arms lose corrections (−0.38):
 a template that omits decisions cannot stand in for a ledger that still has them.
 
+## Result 3 — the five sections are not equally load-bearing (v10)
+
+v9 said the minimal template beats the full one for a quarter of the tokens, but
+not *which* of its five sections did the work. v10 drops each one in turn and
+measures the paired difference against `template_minimal` over the same 12
+cells. A section that earns its tokens loses recall when removed; a section that
+is dead weight does not.
+
+| variant | extra chars | what changes vs `template_minimal` |
+|---|--:|---|
+| `minus_open` | +413 | **open-loop −0.833** (0 wins / 11 losses, 1.00 → 0.17) |
+| `minus_values` | +374 | **values −0.375** (0 W / 10 L), **fact −0.174** (1 W / 9 L) |
+| `minus_files` | +439 | nothing: next-step +0.056 (1 W / 0 L), correction −0.028 |
+| `minus_errors` | +508 | nothing: error −0.028 (0 W / 1 L), decision +0.028 |
+| `plus_success` | +607 | nothing measurable, **including task success +0.000 (0 W / 0 L / 12 ties)** |
+| `anchors` | +613 | decision +0.028, next-step +0.056 (1 W / 0 L), choice +0.083, task +0.083, error −0.056 (2 W / 3 L) |
+
+Two sections carry nearly all the value. **Open questions / pending asks** is
+the whole of the open-loop result: remove it and the open-loop number collapses
+to 0.17, which is also where `current_goals` sits. **Critical exact values**
+costs two metrics when removed (values and fact, which is their mean). Those
+two are worth their ~40 tokens each.
+
+**Files and errors are dead weight for this generator, not in principle.** The
+7B leaves both sections nearly empty (Result 2), so removing them removes
+nothing and the ablation cannot price them. That is a limit of the evidence, and
+it is why the deterministic arm exists.
+
+> **Correction (added after v11).** This paragraph was wrong, and the ablation
+> behind it is void. `_is_empty` treated a dict as empty when *none* of its
+> children was empty — inverted. `_as_list` filters every list item through it,
+> so any section whose value was a dict (`files_symbols_references`,
+> `errors_and_fixes`, `progress`, `decisions_and_rationale`) rendered **nothing**
+> in v8, v9 and v10. The `minus_files` and `minus_errors` arms were therefore
+> removing sections that were already blank in every arm, which is why they
+> measured exactly zero. The same bug capped `template_minimal` at 535 rendered
+> chars when the identical cached template renders 804 once fixed — so the v9
+> cost figure understates the template it claimed to price. The fix landed before
+> v11, which is why v11's `template_minimal` is larger and scores differently.
+> Treat every files/errors number in v8–v10 as unmeasured, not as zero.
+
+**The task-success deficit is not a missing success-criteria section.** v9
+measured `template_minimal` at −0.167 on task success against the full template,
+and the obvious suspect was the dropped success criteria. Adding a success
+section back changes task success by exactly 0.000 across all 12 cells. Whatever
+costs the compact arms their task success, it is not that section — most likely
+it is the loss of the long-tail context the full template keeps, but v10 does
+not isolate it.
+
+**Anchors are free.** Tagging each bullet with the turn it came from costs 76
+characters and never loses: choice and task success +0.083, next-step +0.056,
+with one small error-recall loss that ties out.
+
+## Result 4 — copied facts beat generated ones on decisions, lose on recall (v11)
+
+v11 pits the repaired deterministic extractor against the model-generated
+minimal template, with the rendering bug fixed and the same cache, seed and
+depths. Three arms, 36 rows, 89/89 controls.
+
+| arm | extra tok/turn | constr | correction | error | values | fact | open-loop | choice | task |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| `current_goals` (today) | 0 | 0.67 | 0.78 | 0.58 | 0.58 | 0.58 | 0.29 | 0.83 | 0.67 |
+| `template_minimal` | +201 | 0.71 | 0.83 | 1.00 | 0.96 | 0.98 | 1.00 | 0.83 | 0.67 |
+| `template_det` | **+313** | 0.73 | 0.86 | 0.94 | 0.79 | 0.87 | 0.71 | **1.00** | **0.92** |
+
+Both arms beat today's injection comfortably. Against `current_goals`,
+`template_minimal` gains open-loop **+0.708** (10 wins / 0 losses), values
++0.375, fact +0.396, error +0.417; `template_det` gains error +0.361, open-loop
++0.417, fact +0.285, values +0.208, and is the only arm that moves task success
+(+0.250, 3 W / 0 L) and decision choice (+0.167, 2 W / 0 L).
+
+Head to head, the deterministic arm is **not** the free win its offline ceiling
+suggested. It loses open-loop −0.292 (0 W / 5 L), values −0.167 (0 W / 6 L),
+fact −0.111 (0 W / 7 L) and error −0.056, while winning task success +0.250
+(3 W / 0 L) and choice +0.167 (2 W / 0 L) — for 56% more tokens.
+
+The offline measurement said the deterministic template *carries* open-loop,
+values and errors at 1.00; measured through the model it delivers 0.71, 0.79 and
+0.94. So the gap is in delivery, not extraction: a longer, denser template that
+mixes verbatim facts with tool-output noise is harder for a 7B to use than a
+short one written in its own register. Copying the fact is not the same as
+making it usable.
+
 ## Recommendation
 
 1. **Prefer the additive, minimal template.** Template sections pay for themselves
-   as an addition to the ledger, at ~134 tokens per turn; replacing the ledger with
-   a template loses what the generator never wrote.
-2. **Ship the five-section template, not the ten-section one**, unless task success
-   is the metric that matters — then the full template's extra sections earn their
-   ~370 additional tokens per turn. That is the one open trade-off this run cannot
-   settle.
-3. **Keep the strict validation rule as the default**, and treat a run under
+   as an addition to the ledger; replacing the ledger with a template loses what
+   the generator never wrote. (Cost figures from v9/v10 are understated — see the
+   correction in Result 3. v11's numbers are the ones fixed after that bug.)
+2. **Ship the generated minimal template as the default.** In v11's head-to-head
+   it delivers the best recall per token: +201 tok/turn, open-loop 1.00, values
+   0.96, fact 0.98, all from `current_goals` baselines near 0.3–0.6.
+3. **Keep the deterministic extractor as the fallback, not the replacement.**
+   It needs no generator, so it is the only arm that still works on a model that
+   writes empty fields — and it is the only arm that improved task success and
+   decision choice. But it costs 56% more tokens and loses recall, so it is the
+   right answer only where a generation call is unavailable or unreliable.
+4. **Before shipping the deterministic arm, cut its noise.** Its 8 value slots
+   fill with tool-output chatter (`pytest -q -> 214 passed…`, `coverage -> 87.4
+   percent…`), which is the most likely cause of its delivery gap and is a cheap
+   fix: drop clauses whose only role is reporting a command's output.
+5. **Keep the strict validation rule as the default**, and treat a run under
    `TC_BENCH_COVERAGE_MIN=-1` as a loose-template run. The rule is what surfaced
    Result 2; loosening it by default would hide it again.
-4. **Improve generation before shrinking the template further.** On qwen2.5:7b the
-   template is already mostly empty, so the remaining wins are in making the model
-   fill the fields, or in using a stronger generator.
 
 ## Threats to validity
 

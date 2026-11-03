@@ -1354,7 +1354,9 @@ def _is_empty(value: Any) -> bool:
     if isinstance(value, (list, tuple)):
         return not value
     if isinstance(value, dict):
-        return not any(_is_empty(v) for v in value.values())
+        # Empty means every child is empty. Using any() here made a progress
+        # block of nothing but empty lists count as content.
+        return all(_is_empty(v) for v in value.values())
     return False
 
 
@@ -1504,18 +1506,49 @@ def _minimal_arm_keys(arm: str) -> tuple[str, ...]:
 # call, no hallucination, and no silent omission of the kind that left all 30
 # generated templates without decisions.
 _DET_ERROR_RE = re.compile(
-    r"^(?:Traceback|panic:|npm ERR!|error TS\d+|SyntaxError|TypeError|ValueError|"
-    r"error:|fatal error|segmentation fault)",
+    r"(?:Traceback|panic:|npm ERR!|error TS\d+|SyntaxError|TypeError|ValueError|"
+    r"OSError|Errno|too many open files|error:|fatal error|segmentation fault|"
+    r"^\s*(?:Fix|Fixed|Resolution)\s*:|"
+    # Raised codes: SQLITE_ERROR:, AUDIT_GAP_409:. Case-sensitive on purpose,
+    # so "file_name:" in prose does not read as an error.
+    r"(?-i:^\s*(?:Hit\s+)?[A-Z][A-Z0-9]*_[A-Z0-9_]+\s*:))",
     re.I,
 )
+# A command worth rerunning: "searchctl build --docs 1000000".
+_DET_FLAG_RE = re.compile(r"(?:^|\s)--[a-z][\w-]*\b")
 _DET_PATH_RE = re.compile(
-    r"(?:[\w.-]+/)*[\w.-]+\.(?:py|ts|tsx|js|jsx|json|md|toml|ya?ml|go|rs|java|lua|sql|sh|css|html)"
-    r"(?::\d+)?"
+    # Longest extension first, and a token boundary after it: without the
+    # boundary "web/routes/checkout.tsx" matches as "checkout.ts".
+    r"(?:[\w.-]+/)*[\w.-]+\.(?:tsx|ts|jsx|js|json|toml|ya?ml|py|md|go|rs|java|lua|sql|sh|css|html)"
+    r"(?![\w])(?::\d+)?"
 )
-_DET_VALUE_RE = re.compile(
-    r"(?<![\w.])\d+(?:\.\d+)?\s?(?:ms|s|%|MB|GB|KB|rps|days?|hours?|minutes?|turns?)\b",
+# A symbol the resumed agent would have to reopen. Call shape only, and both
+# spellings: real code is as often preloadCheckoutChunk() as stream_export(),
+# and matching only snake_case silently dropped every camelCase symbol.
+_DET_CALL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]{2,})\s*\(")
+# Language keywords that read as calls in prose but name nothing.
+_DET_CALL_STOP = frozenset(
+    {"if", "for", "while", "switch", "catch", "return", "print", "and", "or", "not"}
+)
+# "at line 64" is half of a file reference; the path alone loses it.
+_DET_LINE_RE = re.compile(r"\bline\s+\d+\b", re.I)
+# Strong numbers carry a unit, a version shape, or an explicit label. A bare
+# integer is weak: the transcript is full of "Turn 12" and "17 warnings", and
+# ranking every integer equally buries the port number under noise.
+_DET_STRONG_NUM_RE = re.compile(
+    r"(?<![\w.])\d+(?:\.\d+)+|"
+    r"(?<![\w.])\d+(?:\.\d+)?\s?(?:ms|s|%|MB|GB|KB|rps|days?|hours?|minutes?|h|hrs?)\b|"
+    r"(?<![\w.])\d+(?:\.\d+)?\s?[kKMB]\b|"
+    r"(?:port|version|v)\s?\d+|"
+    r"(?<![\w.])\d+(?=\s*(?:shards|handles|retries|workers|seconds|lines))",
     re.I,
 )
+# A trailing period must not hide a number: "python -m x --shards 8." is a
+# fact, and requiring a non-word character after the digit dropped it whenever
+# the clause ended in a full stop.
+_DET_WEAK_NUM_RE = re.compile(r"(?<![\w.])\d+(?:\.\d+)?(?!\w)")
+_DET_TURN_PREFIX_RE = re.compile(r"^\s*Turn\s+\d+\s*:\s*", re.I)
+_DET_CLAUSE_SPLIT_RE = re.compile(r"(?<=[.;!?])\s+")
 _DET_ASK_RE = re.compile(
     r"\b(?:please|let's|lets|add|remove|rename|make sure|don't|do not|wait until|one more|"
     r"need to|must|should|instead|avoid|ensure)\b",
@@ -1554,6 +1587,40 @@ def _tidy(item: str, limit: int = 160) -> str:
     return text
 
 
+def _det_clauses(text: str) -> list[str]:
+    """Split a turn into sentence-sized clauses, without its ``Turn N:`` prefix.
+
+    Clause granularity is the point: a bare number carries no meaning on its
+    own ("8" could be a port, a count or a timeout), but the sentence around it
+    does, and that sentence is what the recall keywords are matched against.
+    The turn prefix is removed first because "Turn 12:" would otherwise make
+    every distraction look like a turn that mentions a number.
+    """
+    text = _DET_TURN_PREFIX_RE.sub("", text, count=1)
+    clauses: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        for clause in _DET_CLAUSE_SPLIT_RE.split(stripped):
+            clause = clause.strip()
+            if clause:
+                clauses.append(clause)
+    return clauses
+
+
+def _det_rank(scored: list[tuple[float, int, int, str]], cap: int) -> list[str]:
+    """Strongest facts first, transcript order as the tie-break."""
+    scored = sorted(scored, key=lambda item: (-item[0], item[1], item[2]))
+    out: list[str] = []
+    for _score, _turn, _clause, text in scored:
+        if text not in out:
+            out.append(text)
+        if len(out) >= cap:
+            break
+    return out
+
+
 def extract_deterministic_facts(
     turns: list[dict[str, Any]], ledger_text: str = ""
 ) -> tuple[dict[str, Any], dict[str, str]]:
@@ -1563,41 +1630,71 @@ def extract_deterministic_facts(
     exact anchors rather than a search result.
     """
     ledger_compact = _compact(ledger_text)
-    found: dict[str, list[str]] = {key: [] for key in DET_CAPS}
+    errors: list[tuple[float, int, int, str]] = []
+    values: list[tuple[float, int, int, str]] = []
+    asks: list[tuple[float, int, int, str]] = []
+    files: list[tuple[float, int, int, str]] = []
     anchors: dict[str, str] = {}
-    for turn in turns:
+    for t_index, turn in enumerate(turns):
         role = str(turn.get("role", "")).lower()
-        text = str(turn.get("text", ""))
         where = str(turn.get("n", "?"))
-        for line in text.splitlines():
-            stripped = line.strip()
-            if not stripped:
-                continue
-            if _DET_ERROR_RE.match(stripped):
-                tidy = _tidy(stripped)
-                found["errors_and_fixes"].append(tidy)
-                anchors.setdefault(tidy, where)
-            for path in _DET_PATH_RE.findall(stripped):
-                found["files_symbols_references"].append(path)
-                anchors.setdefault(path, where)
-            for value in _DET_VALUE_RE.findall(stripped):
-                found["critical_exact_values"].append(value.strip())
-                anchors.setdefault(value.strip(), where)
+        for c_index, clause in enumerate(_det_clauses(str(turn.get("text", "")))):
+            is_error = bool(_DET_ERROR_RE.search(clause))
+            strong_hits = len(_DET_STRONG_NUM_RE.findall(clause))
+            weak = bool(_DET_WEAK_NUM_RE.search(clause))
+            tidy = _tidy(clause)
+            # Ranking is a proxy for "worth a slot", and two signals separate a
+            # stated fact from a tool log: a user turn stated it, and the clause
+            # carries several exact values rather than one incidental count.
+            # Without this, "214 passed, 3 skipped in 8.4s" ties with the port
+            # number and the cap fills with chatter.
+            rank = 1.0 + (2.0 if role == "user" else 0.0) + min(strong_hits, 3) * 0.5
+            if is_error:
+                errors.append((rank + 3.0, t_index, c_index, tidy))
+            elif strong_hits or weak:
+                values.append((rank, t_index, c_index, tidy))
             # Only user turns carry asks; an assistant sentence that happens to
             # say "should" is commentary, not a request to act on.
-            if role == "user" and _DET_ASK_RE.search(stripped):
-                for sentence in re.split(r"(?<=[.!?])\s+", stripped):
-                    if _DET_ASK_RE.search(sentence):
-                        ask = _tidy(sentence)
-                        found["open_questions_pending_asks"].append(ask)
-                        anchors.setdefault(ask, where)
+            elif role == "user" and _DET_ASK_RE.search(clause):
+                asks.append((1.0, t_index, c_index, tidy))
+            for path in _DET_PATH_RE.findall(clause):
+                files.append((2.0, t_index, c_index, path))
+                anchors.setdefault(path, where)
+            for ident in _DET_CALL_RE.findall(clause):
+                # Only call-shaped names: a bare word is as likely to be prose
+                # ("file_handles") as a symbol to reopen.
+                if ident.lower() not in _DET_CALL_STOP:
+                    files.append((2.0, t_index, c_index, ident))
+                    anchors.setdefault(ident, where)
+            for line_ref in _DET_LINE_RE.findall(clause):
+                files.append((2.0, t_index, c_index, line_ref))
+                anchors.setdefault(line_ref, where)
+            # A command the next turn will want to rerun is as exact a
+            # reference as a path, and it is invisible to every other rule
+            # because it carries no file extension.
+            if _DET_FLAG_RE.search(clause) and not is_error:
+                files.append((2.5, t_index, c_index, tidy))
+                anchors.setdefault(tidy, where)
     obj: dict[str, Any] = {}
-    for key, items in found.items():
-        deduped = _dedupe_against_ledger(items, ledger_compact)
-        # Preserve first-seen order, drop exact repeats.
-        unique = list(dict.fromkeys(deduped))[: DET_CAPS[key]]
-        if unique:
-            obj[key] = unique
+    payload = {
+        # Priority order: a clause lands in the most specific section that
+        # matches it and is not repeated below. The same sentence otherwise
+        # appeared under files (it names a command) and under values (it names
+        # a shard count), paying twice for one fact.
+        "errors_and_fixes": (errors, DET_CAPS["errors_and_fixes"]),
+        "open_questions_pending_asks": (asks, DET_CAPS["open_questions_pending_asks"]),
+        "files_symbols_references": (files, DET_CAPS["files_symbols_references"]),
+        "critical_exact_values": (values, DET_CAPS["critical_exact_values"]),
+    }
+    placed: set[str] = set()
+    for key, (scored, cap) in payload.items():
+        for _score, _t, _c, text in scored:
+            anchors.setdefault(text, str(turns[_t].get("n", "?")))
+        items = [item for item in _det_rank(scored, cap) if item not in placed]
+        placed.update(items)
+        items = list(dict.fromkeys(_dedupe_against_ledger(items, ledger_compact)))
+        if items:
+            obj[key] = items
     return obj, anchors
 
 
@@ -2853,6 +2950,67 @@ def cost_projection(aggregates: dict[str, Any], baseline: str) -> dict[str, Any]
 # Main
 # ---------------------------------------------------------------------------
 
+def _run_deterministic_controls() -> dict[str, Any]:
+    """Offline controls for the regex extractor. No model calls, so cheap.
+
+    The extractor reports numbers without a model in the loop, which makes it
+    exactly the kind of component that can silently return nothing and look
+    fine. Each check below is a shape that has already broken once.
+    """
+    checks: list[dict[str, Any]] = []
+
+    def check(name: str, ok: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(ok), "detail": detail})
+
+    turns = [
+        {"n": 1, "role": "user", "text":
+         "- Keep memory under 200 MB\n- Please add a --dry-run flag before finishing."},
+        {"n": 2, "role": "assistant", "text":
+         "Hit OSError: [Errno 24] Too many open files. Fix: reuse a pool of 8 handles."},
+        {"n": 3, "role": "assistant", "text":
+         "The helper preloadCheckoutChunk() lives in web/routes/checkout.tsx at line 64."},
+    ]
+    obj, _ = extract_deterministic_facts(turns)
+    values = " ".join(obj.get("critical_exact_values", []))
+    errors = " ".join(obj.get("errors_and_fixes", []))
+    asks = " ".join(obj.get("open_questions_pending_asks", []))
+    files = obj.get("files_symbols_references", [])
+    check("det known-positive: value clause kept whole", "200 MB" in values, values[:80])
+    check("det known-positive: error kept", "Too many open files" in errors, errors[:80])
+    check("det known-positive: fix attached to error section", "reuse a pool" in errors, errors[:80])
+    check("det known-positive: user ask kept", "dry-run" in asks, asks[:80])
+    check("det known-positive: camelCase symbol kept", "preloadCheckoutChunk" in files, str(files))
+    check("det known-positive: line reference kept", "line 64" in files, str(files))
+    check(
+        "det known-negative: .tsx is not truncated to .ts",
+        "web/routes/checkout.tsx" in files and "web/routes/checkout.ts" not in files,
+        str(files),
+    )
+    # The distraction tail is numbered "Turn 12: ..."; if the turn prefix were
+    # not stripped, every one of them would register as a clause with a value.
+    noise = [{"n": n, "role": "assistant", "text": f"Turn {n}: nothing of note happened."}
+             for n in (2, 7, 12, 30)]
+    obj, _ = extract_deterministic_facts(noise)
+    check("det known-negative: no facts from numbered distractions", obj == {}, str(obj))
+    obj, _ = extract_deterministic_facts([])
+    check("det known-negative: empty transcript yields nothing", obj == {}, str(obj))
+
+    # Empty-guard: an object whose children are all empty carries nothing.
+    check(
+        "empty-guard: all-empty dict is empty",
+        _is_empty({"done": [], "in_progress": [], "blocked": []}),
+        "all-empty progress counted as content",
+    )
+    check(
+        "empty-guard: partly-filled dict is not empty",
+        not _is_empty({"done": ["x"], "in_progress": []}),
+        "a filled progress block counted as empty",
+    )
+    check("empty-guard: empty dict is empty", _is_empty({}), "{} counted as content")
+
+    return {"checks": checks, "passed": all(item["ok"] for item in checks)}
+
+
 def run_controls(
     plugin,
     scenarios: list[dict[str, Any]],
@@ -2893,6 +3051,12 @@ def run_controls(
         flush=True,
     )
     controls["generation_sanity"] = _run_generation_control(templates)
+    controls["deterministic"] = _run_deterministic_controls()
+    print(
+        f"[controls] deterministic passed={controls['deterministic']['passed']} "
+        f"checks={len(controls['deterministic']['checks'])}",
+        flush=True,
+    )
     print(
         f"[controls] generation-sanity passed={controls['generation_sanity']['passed']} "
         f"checks={len(controls['generation_sanity']['checks'])}",
@@ -2906,6 +3070,7 @@ def run_controls(
         "probe_shape",
         "template",
         "generation_sanity",
+        "deterministic",
     ):
         # A group's "passed" flag and the flattened per-check result must agree;
         # they diverged once (a per-scenario no-context check flagged a failure
