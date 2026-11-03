@@ -52,7 +52,7 @@ except ImportError:  # pragma: no cover - Windows fallback
     fcntl = None  # type: ignore[assignment]
 
 
-VERSION = "1.10.0"
+VERSION = "1.10.1"
 SCHEMA_VERSION = 1
 PLUGIN_NAME = "claude-append-compactor"
 
