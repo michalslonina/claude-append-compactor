@@ -231,6 +231,16 @@ no repeats.
 5. **Keep the strict validation rule as the default**, and treat a run under
    `TC_BENCH_COVERAGE_MIN=-1` as a loose-template run. The rule is what surfaced
    Result 2; loosening it by default would hide it again.
+6. **Add the tag journal only as the bookkeeping layer — open/closed state.**
+   Result 5 prices it: grounded emission works in the source-anchored form
+   (`※v 12 …`, 14/14 grounded, anchors all valid, −23% tags) and holds up over
+   five turns without reminders. But the copy verifier rejects derived
+   reasoning, and the verifier is the whole point — drop it and a third of the
+   tags are invented. So facts and errors come from the template or the
+   deterministic extractor, and the journal contributes only what neither can
+   know: which tasks are still open. Before building the harvester, audit
+   whether the `t`/`d` tags carry more than the instruction they echo back; in
+   the probe several did not, and that check has not been run.
 
 ## Threats to validity
 
