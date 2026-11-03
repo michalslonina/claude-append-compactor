@@ -162,6 +162,54 @@ mixes verbatim facts with tool-output noise is harder for a 7B to use than a
 short one written in its own register. Copying the fact is not the same as
 making it usable.
 
+## Result 5 — model-emitted tags can be made verifiable (journal probe)
+
+A different injection mechanism from the templates above: the model drops tagged
+lines as it works (`※v` value, `※e` error, `※f` fix, `※t` task, `※d` done), and
+a regex harvests them into the handoff. Marker is `※` (U+203B) at line start;
+the entry runs to end of line, because every punctuation candidate occurs inside
+the values we care about (`2.7.1`, `src/export/csv_writer.py`,
+`Hit OSError: [Errno 24]`).
+
+DeepSeek, synthetic situations, 21 calls across three experiments.
+
+**Emission.** With the grammar explained, 21/21 tags were well-formed across
+three runs; with no instruction, 0 tags in all three controls. `※d` closures
+appeared in 3/3 instructed runs. Syntax is not the risk.
+
+**Invention is the risk.** In the first experiment 6 of 21 tags were invented —
+including a proposed constant tagged as an established fact
+(`※v MERGE_STALL_TIMEOUT_S 30.0`) and a model inference tagged as an observed
+error. A regex cannot tell a copy from a plausible invention.
+
+**A contiguous-copy check fixes it, and the model can be steered to pass it.**
+Grounding = the body appears contiguously in the supplied context (case,
+whitespace and edge punctuation normalised; word overlap deliberately does not
+count). Verifier controls 5/5, including the actual invented constant and a
+stitched-words negative.
+
+| condition | v/e emitted | v/e grounded | cost vs baseline |
+|---|--:|--:|---|
+| A: tag as you work | 16 | 10 (62.5%) | — |
+| B: verbatim-only | 11 | **11 (100%)** | −32% tags, format collapse in 1 of 5 |
+| C: verbatim + source turn (`※v 12 …`) | 14 | **14 (100%)**, all anchors valid | −23% tags |
+
+C dominates B: same verifiability, more volume, and the anchor gives an auditor
+a place to check. Persistence held over 5 sequential turns with the protocol
+stated once — 100% grounded on every turn, no format decay, though volume fell
+from 10 tags to 2 and recovered to 6.
+
+**What it costs.** The model tags only what it can copy, so derived reasoning is
+dropped — a computed "1040 s used of 1200 s budget" is exactly the kind of
+conclusion a handoff should carry and exactly what the verifier rejects. And
+verifiable is not the same as useful: several `t`/`d` pairs merely echoed a user
+instruction and closed it immediately.
+
+So a verifiable journal holds **copied facts and open/closed state, not
+reasoning** — which is the same division of labour v11 arrived at from the other
+direction. Limits: n=5 situations per condition, one model, one sample per cell,
+no repeats.
+
 ## Recommendation
 
 1. **Prefer the additive, minimal template.** Template sections pay for themselves
