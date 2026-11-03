@@ -84,6 +84,7 @@ def isolated_environment(tmp_path, monkeypatch):
     monkeypatch.delenv("APPEND_COMPACT_L3_MAX_FILES", raising=False)
     monkeypatch.delenv("APPEND_COMPACT_L3_COMPRESS", raising=False)
     monkeypatch.delenv("APPEND_COMPACT_L3_ZSTD_LEVEL", raising=False)
+    monkeypatch.delenv("APPEND_COMPACT_L2_DIGEST_CHARS", raising=False)
     for name in (
         "APPEND_COMPACT_GOALS",
         "APPEND_COMPACT_GOALS_EXTRACT",
@@ -770,6 +771,18 @@ def test_l3_omitted_metadata_accounts_for_every_block(tmp_path, monkeypatch):
     assert payload["additional_context"].endswith(
         "[append-compactor: older context omitted to fit the 10k hook cap]"
     )
+
+
+def test_l2_digest_chars_is_configurable(monkeypatch):
+    def master_size() -> int:
+        state = _fresh_state()
+        for index in range(6):
+            _append(state, f"Turn {index} " + "the retry worker drains the queue " * 12)
+        return len(state["l2_masters"][0]["block"])
+
+    default = master_size()
+    monkeypatch.setenv("APPEND_COMPACT_L2_DIGEST_CHARS", "120")
+    assert master_size() < default - 6 * 200
 
 
 def test_l3_drift_stable_drift_and_short_prompt(monkeypatch):

@@ -187,6 +187,10 @@ def _env_int(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
+def _l2_digest_chars() -> int:
+    return max(80, _env_int("APPEND_COMPACT_L2_DIGEST_CHARS", L2_DIGEST_CHARS))
+
+
 def _env_float(name: str, default: float) -> float:
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
@@ -3650,7 +3654,7 @@ def _render_master_block(
     for chunk in batch:
         lines.append(f"#### Chunk #{chunk['n']}")
         lines.extend(_chunk_pointer_lines(chunk))
-        lines.append(_digest(chunk.get("compressed_text", ""), L2_DIGEST_CHARS))
+        lines.append(_digest(chunk.get("compressed_text", ""), _l2_digest_chars()))
     return "\n".join(lines), covered, entities
 
 
