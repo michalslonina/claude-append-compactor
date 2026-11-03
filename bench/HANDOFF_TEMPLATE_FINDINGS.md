@@ -242,6 +242,15 @@ no repeats.
    whether the `t`/`d` tags carry more than the instruction they echo back; in
    the probe several did not, and that check has not been run.
 
+**Shipped as 1.10.0 (deterministic half only).** The handoff section in
+`hooks/scripts/append-compact.py` implements recommendations 1 and 3-4: four
+sections (open asks, errors, files/symbols, exact values), built by copying at
+commit time, rendered into the volatile half of the injection so the cached
+head is unchanged, and deduped against the ledger. The journal grammar and its
+grounding verifier are implemented behind `APPEND_COMPACT_JOURNAL` (off by
+default, per recommendation 6). Generated handoffs are **not** wired in: there
+is no model call on this path, so v11's recall advantage is not what ships.
+
 ## Threats to validity
 
 - Synthetic sessions, one small local model, one sample per cell. Paired, not a

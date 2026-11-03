@@ -67,6 +67,29 @@ python3 bench/backend_bench.py --no-chain
 turn text and model output, so it is **not** committed; only aggregate numbers
 belong in the README.
 
+## L3 retrieval and retention
+
+```sh
+# held-one-sentence-out retrieval on synthetic + real state snapshots
+python3 bench/l3_retrieval.py --synthetic --real
+
+# L3=0 vs default on a read-only real snapshot
+python3 bench/l3_real_check.py --snapshot /tmp/ac-reallog
+
+# exact-fact retention with L3 on/off
+python3 bench/recall.py --arms baseline,l3,fact,fact+l3,all
+```
+
+All three scripts run controls first and exit 2 without numbers if a control
+fails. `l3_retrieval.py` checks archive round-trips, a known-positive (an index
+line ranks its own block first), a known-negative (absent tokens score exactly
+zero), scrambled signals, and full-text sanity. `l3_real_check.py` checks every
+real archive link byte-for-byte, rejects a fabricated link, compares the pinned
+ledger prefix, and fails if L3 represents fewer blocks than the baseline. L3
+archive links are zstd `--ultra -22` frames; the round-trip control decompresses
+each one and re-hashes the plaintext, which is the same bytes `ugrep -z` or
+`zstd -dc` reads.
+
 ---
 
 ## Results — 2026-10-31
@@ -129,3 +152,66 @@ cargo build and a separate Ollama job), so the latency columns are upper
 bounds; shrink and recall are unaffected. 13 turns is a directional sample, not
 a corpus-wide claim. The private per-turn results remain in
 `~/.cache/append-compactor-bench/backend-results-v150.json`.
+
+---
+
+## Goal-drift benchmark
+
+`bench/goal_drift.py` is a separate, fully synthetic benchmark for the opt-in
+goal anchors. It builds four sessions with one explicit mission and distraction
+turns, renders the compacted context, and asks local Ollama `qwen2.5:7b`
+(temperature 0, JSON mode, seed 42/43) to restate the mission and choose the
+next action. Conditions cover every placement: baseline, level-only anchors,
+tail, beginning, middle (a lost-in-the-middle control), after-head, per-level,
+hybrid, hybrid plus a forced reminder, and a shuffled control. It reports goal,
+constraint and success-criteria recall, drift, a task-success proxy, injection
+characters and measured prompt tokens.
+
+The harness exits non-zero unless five controls pass: the scorer returns 1.0
+for a gold answer and 0 for empty/shuffled answers, the model recalls a
+verbatim goal and constraints, and the model invents nothing when no goal is
+stated. It uses only synthetic scenario text; no session data is read or sent
+anywhere.
+
+```sh
+# 2,200-character context, 18 distraction turns
+~/.local/bin/mnice .venv/bin/python bench/goal_drift.py
+GOAL_BENCH_SEED=43 ~/.local/bin/mnice .venv/bin/python bench/goal_drift.py
+
+# longer context used for the placement comparison
+GOAL_BENCH_TARGET_CHARS=6000 GOAL_BENCH_DISTRACTIONS=120 \
+  GOAL_BENCH_OUT=bench/goal_drift_results_long.json \
+  ~/.local/bin/mnice .venv/bin/python bench/goal_drift.py
+```
+
+Results are written to `bench/goal_drift_results.json` by default; use
+`GOAL_BENCH_OUT` to keep runs separate. The committed final results are
+`goal_drift_results_2200.json`, `goal_drift_results_long.json` (seed 42) and
+`goal_drift_results_long_seed43.json`. The README's goal-anchor section reports
+the measured tables and the (estimated) DeepSeek cost projection. The raw
+responses are synthetic and safe to keep, but they are model-specific and not a
+substitute for a workload-specific evaluation.
+
+## Goal-anchor prefix-cache probe
+
+`bench/goal_cache_probe.py` measures `prompt_cache_hit_tokens` on synthetic
+two-turn requests to DeepSeek. It compares tail, beginning, after-head,
+per-level, hybrid and no-anchor placements in two deployment models:
+
+- `append` — the Claude Code UserPromptSubmit shape, where each injection is a
+  new user message; prior injections are cached as whole messages.
+- `inplace` — a custom router that replaces one injected block at a fixed
+  position after a stable prefix; this is where anchor placement can change the
+  cached prefix.
+
+Each model is run with a stable head and with a new master every turn. The
+script exits 2 unless an identical repeat hits at least 90 % of the warm-up
+prompt and a fully unique prompt hits exactly zero. It uses synthetic text
+only, reads the API key from the environment or
+`~/.config/model-router/env` without printing it, and writes
+`bench/goal_cache_results.json`.
+
+```sh
+~/.local/bin/mnice .venv/bin/python bench/goal_cache_probe.py \
+  --model deepseek-flash
+```
