@@ -66,6 +66,16 @@ ARMS = (
     "current_goals",
     "current_goals_template",
     "template_minimal",
+    # Section ablations: each variant drops or adds one section so the set is
+    # earned by measurement rather than chosen by argument.
+    "template_minimal_anchors",
+    "template_minimal_minus_files",
+    "template_minimal_minus_errors",
+    "template_minimal_minus_open",
+    "template_minimal_minus_values",
+    "template_minimal_plus_success",
+    # No model in the loop: regex extraction, ledger dedupe, per-section caps.
+    "template_det",
     "template_only",
     "template_ledger",
     "shuffled_template",
@@ -1398,17 +1408,197 @@ MINIMAL_TEMPLATE_KEYS = (
 )
 
 
-def render_minimal_template(obj: dict[str, Any]) -> str:
-    """The full template cut down to the sections that earned their tokens."""
+# Variants of the minimal arm, so each section can be earned or dropped by
+# measurement instead of argument.  ``drop`` names object keys to leave out,
+# ``add`` appends a section the minimal set omits, ``use_anchors`` appends the
+# turn a bullet came from.
+MINIMAL_ARM_KWARGS: dict[str, dict[str, Any]] = {
+    "template_minimal": {},
+    "template_minimal_anchors": {"use_anchors": True},
+    "template_minimal_minus_files": {"drop": ("files_symbols_references",)},
+    "template_minimal_minus_errors": {"drop": ("errors_and_fixes",)},
+    "template_minimal_minus_open": {"drop": ("open_questions_pending_asks",)},
+    "template_minimal_minus_values": {"drop": ("critical_exact_values",)},
+    "template_minimal_plus_success": {"add": (("Success criteria", "success_criteria"),)},
+}
+
+
+def _locate_turn(item: str, turns: list[dict[str, Any]]) -> str:
+    """Best-effort turn number for a bullet.
+
+    Attribution is a string search, not model output: the generator never says
+    which turn a fact came from, and asking it would add another thing a weak
+    model can get wrong.
+    """
+    needle = _compact(item)
+    if not needle:
+        return "?"
+    words = [word for word in needle.split() if len(word) >= 4][:6]
+    for turn in turns:
+        haystack = _compact(turn.get("text", ""))
+        if needle in haystack or (words and all(word in haystack for word in words)):
+            return str(turn.get("n", "?"))
+    return "?"
+
+
+def render_minimal_template(
+    obj: dict[str, Any],
+    *,
+    drop: tuple[str, ...] = (),
+    add: tuple[tuple[str, str], ...] = (),
+    turns: list[dict[str, Any]] | None = None,
+    anchors: dict[str, str] | None = None,
+    max_per_section: int = 0,
+) -> str:
+    """The full template cut down to the sections that earned their tokens.
+
+    ``max_per_section`` is the cap arm: a chatty generation cannot spend the
+    whole prefix on one section.  ``anchors`` carries exact turn numbers (the
+    deterministic arm knows them); ``turns`` instead locates each bullet by
+    search, which is what the generated arms have to do.
+    """
+    sections = [pair for pair in MINIMAL_TEMPLATE_KEYS if pair[1] not in drop]
+    sections.extend(add)
     lines = ["## Session handoff (key facts)"]
-    for heading, key in MINIMAL_TEMPLATE_KEYS:
+    for heading, key in sections:
         items = _as_list(obj.get(key))
         if not items:
             continue
+        if max_per_section:
+            items = items[:max_per_section]
         lines.append("")
         lines.append(f"### {heading}")
-        lines.extend(f"- {item}" for item in items)
+        for item in items:
+            if anchors and item in anchors:
+                lines.append(f"- {item} (turn {anchors[item]})")
+            elif turns:
+                lines.append(f"- {item} (turn {_locate_turn(item, turns)})")
+            else:
+                lines.append(f"- {item}")
     return "\n".join(lines)
+
+
+def render_minimal_arm(
+    arm: str, obj: dict[str, Any], turns: list[dict[str, Any]] | None = None
+) -> str:
+    """Render one of the MINIMAL_ARM_KWARGS variants."""
+    kwargs = dict(MINIMAL_ARM_KWARGS.get(arm, {}))
+    if kwargs.pop("use_anchors", False) and turns:
+        kwargs["turns"] = turns
+    return render_minimal_template(obj, **kwargs)
+
+
+def _minimal_arm_keys(arm: str) -> tuple[str, ...]:
+    """Object keys a minimal variant actually renders."""
+    kwargs = MINIMAL_ARM_KWARGS.get(arm, {})
+    drop = kwargs.get("drop", ())
+    keys = [key for _, key in MINIMAL_TEMPLATE_KEYS if key not in drop]
+    keys.extend(key for _, key in kwargs.get("add", ()))
+    return tuple(keys)
+
+
+# --- deterministic extraction ------------------------------------------------
+# Every section that measurably earns its tokens is a copying task -- a path, a
+# value, an error line, a user's request -- not a summarising one.  This arm
+# removes the model from the loop entirely for those sections: no generation
+# call, no hallucination, and no silent omission of the kind that left all 30
+# generated templates without decisions.
+_DET_ERROR_RE = re.compile(
+    r"^(?:Traceback|panic:|npm ERR!|error TS\d+|SyntaxError|TypeError|ValueError|"
+    r"error:|fatal error|segmentation fault)",
+    re.I,
+)
+_DET_PATH_RE = re.compile(
+    r"(?:[\w.-]+/)*[\w.-]+\.(?:py|ts|tsx|js|jsx|json|md|toml|ya?ml|go|rs|java|lua|sql|sh|css|html)"
+    r"(?::\d+)?"
+)
+_DET_VALUE_RE = re.compile(
+    r"(?<![\w.])\d+(?:\.\d+)?\s?(?:ms|s|%|MB|GB|KB|rps|days?|hours?|minutes?|turns?)\b",
+    re.I,
+)
+_DET_ASK_RE = re.compile(
+    r"\b(?:please|let's|lets|add|remove|rename|make sure|don't|do not|wait until|one more|"
+    r"need to|must|should|instead|avoid|ensure)\b",
+    re.I,
+)
+DET_CAPS = {
+    "files_symbols_references": 12,
+    "critical_exact_values": 8,
+    "errors_and_fixes": 6,
+    "open_questions_pending_asks": 8,
+}
+
+
+def _dedupe_against_ledger(items: list[str], ledger_compact: str) -> list[str]:
+    """Drop bullets the injected ledger already carries verbatim-ish."""
+    if not ledger_compact:
+        return items
+    kept = []
+    for item in items:
+        compact = _compact(item)
+        if compact and compact in ledger_compact:
+            continue
+        kept.append(item)
+    return kept
+
+
+def _tidy(item: str, limit: int = 160) -> str:
+    """Strip list markers and cut on a word boundary.
+
+    A transcript line often starts with "- ", which would render as a double
+    bullet, and a hard slice mid-word reads as a typo rather than a truncation.
+    """
+    text = re.sub(r"^[-*+]\s+", "", str(item).strip())
+    if len(text) > limit:
+        text = text[: limit - 3].rsplit(" ", 1)[0] + "..."
+    return text
+
+
+def extract_deterministic_facts(
+    turns: list[dict[str, Any]], ledger_text: str = ""
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Build a handoff from the transcript with regexes, no model call.
+
+    Returns the template object and an {item: turn} map, so the render carries
+    exact anchors rather than a search result.
+    """
+    ledger_compact = _compact(ledger_text)
+    found: dict[str, list[str]] = {key: [] for key in DET_CAPS}
+    anchors: dict[str, str] = {}
+    for turn in turns:
+        role = str(turn.get("role", "")).lower()
+        text = str(turn.get("text", ""))
+        where = str(turn.get("n", "?"))
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if _DET_ERROR_RE.match(stripped):
+                tidy = _tidy(stripped)
+                found["errors_and_fixes"].append(tidy)
+                anchors.setdefault(tidy, where)
+            for path in _DET_PATH_RE.findall(stripped):
+                found["files_symbols_references"].append(path)
+                anchors.setdefault(path, where)
+            for value in _DET_VALUE_RE.findall(stripped):
+                found["critical_exact_values"].append(value.strip())
+                anchors.setdefault(value.strip(), where)
+            # Only user turns carry asks; an assistant sentence that happens to
+            # say "should" is commentary, not a request to act on.
+            if role == "user" and _DET_ASK_RE.search(stripped):
+                for sentence in re.split(r"(?<=[.!?])\s+", stripped):
+                    if _DET_ASK_RE.search(sentence):
+                        ask = _tidy(sentence)
+                        found["open_questions_pending_asks"].append(ask)
+                        anchors.setdefault(ask, where)
+    obj: dict[str, Any] = {}
+    for key, items in found.items():
+        deduped = _dedupe_against_ledger(items, ledger_compact)
+        # Preserve first-seen order, drop exact repeats.
+        unique = list(dict.fromkeys(deduped))[: DET_CAPS[key]]
+        if unique:
+            obj[key] = unique
+    return obj, anchors
 
 
 def render_headers_only() -> str:
@@ -2393,11 +2583,16 @@ def _refuse_empty_template(
         for arm in arm_list
         if arm in TEMPLATE_DEPENDENT_ARMS and not _carries_content(template_obj)
     ]
-    # The minimal arm renders only a subset of the sections, so a template
-    # carrying content elsewhere still leaves that arm equal to its baseline.
-    if "template_minimal" in arm_list and _carries_content(template_obj):
-        if not any(_as_list(template_obj.get(key)) for _, key in MINIMAL_TEMPLATE_KEYS):
-            missing.append("template_minimal")
+    # The minimal variants render only a subset of the sections, so a template
+    # carrying content elsewhere still leaves those arms equal to their
+    # baseline -- and a minus-* variant whose remaining sections are all empty
+    # degenerates the same way.
+    for arm in arm_list:
+        if arm not in MINIMAL_ARM_KWARGS or not _carries_content(template_obj):
+            continue
+        if not any(_as_list(template_obj.get(key)) for key in _minimal_arm_keys(arm)):
+            if arm not in missing:
+                missing.append(arm)
     if "template_regen_only" in arm_list and not _carries_content(regen_obj):
         missing.append("template_regen_only")
     if not missing:
@@ -2424,8 +2619,17 @@ def build_contexts(
     regen_obj: dict[str, Any] | None,
     donor_templates: list[str],
     arms: tuple[str, ...],
-) -> dict[str, str]:
+) -> tuple[dict[str, str], dict[str, int], dict[str, str]]:
+    """Build every requested context, with its template size and provenance.
+
+    Returns (contexts, template_chars, generation).  Size and provenance are
+    computed here rather than re-derived by the caller: a second derivation is
+    a second chance for the reported cost to disagree with the context that was
+    actually measured.
+    """
     contexts: dict[str, str] = {}
+    sizes: dict[str, int] = {}
+    generation: dict[str, str] = {}
     full = render_full_transcript(turns)
     current = plugin_context(plugin, state, session, goals=False)
     current_goals = plugin_context(plugin, state, session, goals=True)
@@ -2441,27 +2645,53 @@ def build_contexts(
         contexts["current_goals"] = current_goals
     if "current_goals_template" in arms:
         contexts["current_goals_template"] = template_text + "\n\n" + current_goals
-    if "template_minimal" in arms:
-        # Same additive shape as current_goals_template, shorter head, so the
-        # only difference between the two arms is how much template is spent.
-        contexts["template_minimal"] = (
-            render_minimal_template(template_obj) + "\n\n" + current_goals
+        sizes["current_goals_template"] = len(template_text)
+        generation["current_goals_template"] = "anchored"
+    # Every minimal variant shares the additive shape, so the only difference
+    # between them is which sections they carry.
+    for arm in MINIMAL_ARM_KWARGS:
+        if arm not in arms:
+            continue
+        text = render_minimal_arm(arm, template_obj, turns)
+        contexts[arm] = text + "\n\n" + current_goals
+        sizes[arm] = len(text)
+        generation[arm] = "anchored-minimal"
+    if "template_det" in arms:
+        # No model call: extracted from the transcript, deduped against the
+        # ledger, capped per section, and anchored to the turn it came from.
+        det_obj, det_anchors = extract_deterministic_facts(turns, ledger)
+        text = render_minimal_template(
+            det_obj, anchors=det_anchors, max_per_section=6
         )
+        contexts["template_det"] = text + "\n\n" + current_goals
+        sizes["template_det"] = len(text)
+        generation["template_det"] = "deterministic"
     if "template_only" in arms:
         contexts["template_only"] = template_text
+        sizes["template_only"] = len(template_text)
+        generation["template_only"] = "anchored"
     if "template_ledger" in arms:
         contexts["template_ledger"] = template_text + "\n\n" + ledger
+        sizes["template_ledger"] = len(template_text)
+        generation["template_ledger"] = "anchored"
     if "shuffled_template" in arms:
         contexts["shuffled_template"] = (
             shuffled_template(template_text, donor_templates, scenario)
             + "\n\n"
             + current_goals
         )
+        sizes["shuffled_template"] = len(contexts["shuffled_template"]) - len(current_goals) - 2
+        generation["shuffled_template"] = "anchored"
     if "headers_only" in arms:
-        contexts["headers_only"] = render_headers_only() + "\n\n" + current_goals
+        header = render_headers_only()
+        contexts["headers_only"] = header + "\n\n" + current_goals
+        sizes["headers_only"] = len(header)
+        generation["headers_only"] = "headers"
     if "template_regen_only" in arms:
         contexts["template_regen_only"] = regen_text
-    return contexts
+        sizes["template_regen_only"] = len(regen_text)
+        generation["template_regen_only"] = "regen"
+    return contexts, sizes, generation
 
 
 # ---------------------------------------------------------------------------
@@ -2702,6 +2932,44 @@ def run_controls(
     return controls
 
 
+def _write_checkpoint(
+    path: Path,
+    rows: list[dict[str, Any]],
+    *,
+    depths: tuple[int, ...],
+    arms: tuple[str, ...],
+) -> None:
+    """Persist measured rows so a killed run can resume instead of restarting.
+
+    The identity recorded is model/seed/depths/arms/coverage policy -- not the
+    harness source. A change to scoring or prompt construction is therefore
+    invisible to resume: old rows keep the old scorer's numbers, so discard the
+    checkpoint by hand when either changes.
+    """
+    path.write_text(
+        json.dumps(
+            {
+                "partial": True,
+                "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                # Identity, so a later --resume can prove the checkpoint belongs
+                # to a run with the same model, seed, depths and arms.
+                "settings_snapshot": {
+                    "model": MODEL,
+                    "provider": PROVIDER,
+                    "seed": SEED,
+                    "depths": list(depths),
+                    "arms": list(arms),
+                    "coverage_min": COVERAGE_MIN,
+                },
+                "rows": rows,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    print(f"[checkpoint] {path} rows={len(rows)}", flush=True)
+
+
 def _scope_note(scenarios: list[dict[str, Any]], depths: tuple[int, ...]) -> str:
     """Describe the scope this run actually had.
 
@@ -2900,6 +3168,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out", default=str(OUT_PATH))
     parser.add_argument("--regen-arm", action="store_true", help="also measure template_regen_only")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="reuse cells from the .partial.json checkpoint next to --out",
+    )
     args = parser.parse_args(argv)
 
     global SEED
@@ -2921,6 +3194,65 @@ def main(argv: list[str] | None = None) -> int:
         generation_depths = (24,)
         arms = ARMS
     out_path = Path(args.out)
+    checkpoint_path = out_path.with_suffix(out_path.suffix + ".partial.json")
+    # A run is hours long on a slow local model, and a killed process loses
+    # everything measured since the last checkpoint. Resume reuses those cells
+    # -- but only cells this run would measure itself, and only when the
+    # checkpoint is provably from the same configuration.
+    scope_keys = {
+        (scenario["id"], depth, arm)
+        for scenario in scenarios
+        for depth in depths
+        for arm in arms
+    }
+    reused_rows: list[dict[str, Any]] = []
+    if args.resume:
+        if not checkpoint_path.exists():
+            raise SystemExit(f"--resume given but no checkpoint at {checkpoint_path}")
+        partial = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        snapshot = partial.get("settings_snapshot") or {}
+        if snapshot:
+            expected = {
+                "model": MODEL,
+                "provider": PROVIDER,
+                "seed": SEED,
+                "depths": list(depths),
+                "arms": list(arms),
+                "coverage_min": COVERAGE_MIN,
+            }
+            if snapshot != expected:
+                raise SystemExit(
+                    "checkpoint was written for a different run:\n"
+                    f"  checkpoint: {snapshot}\n  this run:   {expected}"
+                )
+        else:
+            # Older checkpoints carry no settings; the arm set is the only
+            # identity available, so say plainly what was and was not checked.
+            seen_arms = {row.get("arm") for row in partial.get("rows") or []}
+            extra = sorted(arm for arm in seen_arms - set(arms) if arm)
+            if extra:
+                raise SystemExit(
+                    f"checkpoint contains arms this run does not measure: {extra}"
+                )
+            print(
+                "[resume] WARNING: checkpoint has no settings snapshot; only the "
+                f"arm names were verified ({len(seen_arms) or 0} arms). Confirm it "
+                "came from the same model and provider before trusting the result.",
+                flush=True,
+            )
+        reused_rows = [
+            row
+            for row in partial.get("rows") or []
+            if (row.get("scenario"), row.get("depth"), row.get("arm")) in scope_keys
+        ]
+        print(
+            f"[resume] reusing {len(reused_rows)} of {len(scope_keys)} cells from "
+            f"{checkpoint_path}",
+            flush=True,
+        )
+    done_keys = {
+        (row.get("scenario"), row.get("depth"), row.get("arm")) for row in reused_rows
+    }
     started = time.time()
     plugin = _load_plugin()
 
@@ -2979,7 +3311,7 @@ def main(argv: list[str] | None = None) -> int:
                 print("CONTROL FAILED: refusing to report benchmark numbers", file=sys.stderr)
                 return 2
 
-            rows: list[dict[str, Any]] = []
+            rows: list[dict[str, Any]] = list(reused_rows)
             for scenario in scenarios:
                 data = templates[scenario["id"]]
                 for depth in depths:
@@ -2991,7 +3323,7 @@ def main(argv: list[str] | None = None) -> int:
                         for other in scenarios
                         if other["id"] != scenario["id"]
                     ]
-                    contexts = build_contexts(
+                    contexts, arm_sizes, arm_generation = build_contexts(
                         plugin,
                         scenario,
                         depth,
@@ -3003,30 +3335,19 @@ def main(argv: list[str] | None = None) -> int:
                         donor_templates,
                         arms,
                     )
-                    template_text = render_template(anchored_obj) if anchored_obj else ""
                     for arm in arms:
                         context = contexts.get(arm)
                         if context is None:
                             continue
-                        template_chars = 0
-                        generation = "none"
-                        if arm in {
-                            "current_goals_template",
-                            "template_only",
-                            "template_ledger",
-                            "shuffled_template",
-                            "headers_only",
-                        }:
-                            template_chars = len(template_text)
-                            generation = "anchored"
-                        elif arm == "template_minimal":
-                            template_chars = len(render_minimal_template(anchored_obj))
-                            generation = "anchored-minimal"
-                        elif arm == "template_regen_only":
-                            template_chars = len(render_template(regen_obj))
-                            generation = "regen"
+                        if (scenario["id"], depth, arm) in done_keys:
+                            continue
                         row = measure_row(
-                            scenario, depth, arm, context, template_chars, generation
+                            scenario,
+                            depth,
+                            arm,
+                            context,
+                            arm_sizes.get(arm, 0),
+                            arm_generation.get(arm, "none"),
                         )
                         rows.append(row)
                     elapsed = time.time() - started
@@ -3036,21 +3357,10 @@ def main(argv: list[str] | None = None) -> int:
                         f"avg_row={statistics.fmean(r['latency_s'] for r in rows):.1f}s",
                         flush=True,
                     )
-                checkpoint = out_path.with_suffix(out_path.suffix + ".partial.json")
-                checkpoint.write_text(
-                    json.dumps(
-                        {
-                            "partial": True,
-                            "generated_at": time.strftime(
-                                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
-                            ),
-                            "rows": rows,
-                        },
-                        indent=2,
-                    ),
-                    encoding="utf-8",
-                )
-                print(f"[checkpoint] {checkpoint} rows={len(rows)}", flush=True)
+                    # Checkpoint per depth, not per scenario: a kill between
+                    # checkpoints is what a resume has to redo, and a depth is
+                    # 11 rows rather than 22.
+                    _write_checkpoint(checkpoint_path, rows, depths=depths, arms=arms)
 
     aggregates = aggregate(rows, "arm", list(ARM_RANK))
     depth_rows: list[dict[str, Any]] = []
