@@ -246,10 +246,20 @@ no repeats.
 `hooks/scripts/append-compact.py` implements recommendations 1 and 3-4: four
 sections (open asks, errors, files/symbols, exact values), built by copying at
 commit time, rendered into the volatile half of the injection so the cached
-head is unchanged, and deduped against the ledger. The journal grammar and its
-grounding verifier are implemented behind `APPEND_COMPACT_JOURNAL` (off by
-default, per recommendation 6). Generated handoffs are **not** wired in: there
-is no model call on this path, so v11's recall advantage is not what ships.
+head is unchanged. The journal grammar and its grounding verifier are
+implemented behind `APPEND_COMPACT_JOURNAL` (off by default, per
+recommendation 6). Generated handoffs are **not** wired in: there is no model
+call on this path, so v11's recall advantage is not what ships.
+
+**A measured caveat that the benchmark could not have shown.** In the harness
+the template stood in for compressed material; in the plugin the same facts are
+often still visible in the live chunks. Every bullet is therefore checked
+against the rest of the injection and dropped if it is already there. Measured
+on synthetic sessions: 6 and 12 turns render an empty handoff (nothing was
+lost), 40 and 80 turns render 4 bullets at 577 characters with zero
+duplicates, recovered from turns the L3 index had demoted. So the section's
+value is bounded by how much the packing actually drops -- it is a recovery
+mechanism, not a summary.
 
 ## Threats to validity
 

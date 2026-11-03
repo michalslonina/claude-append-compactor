@@ -1788,6 +1788,9 @@ def _handoff_compact(text: str) -> str:
 def _handoff_tidy(item: str, limit: int = 160) -> str:
     """Strip list markers and cut on a word boundary, never mid-word."""
     text = re.sub(r"^[-*+]\s+", "", str(item).strip())
+    # "Turn 39: ..." is the transcript's own numbering, not part of the fact;
+    # keeping it both wastes a bullet and defeats duplicate detection.
+    text = _HANDOFF_TURN_PREFIX_RE.sub("", text, count=1)
     # A clause split on ";" leaves the separator behind, which renders as a
     # stray semicolon at the end of a bullet.
     text = text.rstrip(";,").strip()
@@ -2000,6 +2003,7 @@ def _render_handoff(
     session: str | None,
     ledger_text: str,
     cap: int | None = None,
+    rest_text: str = "",
 ) -> tuple[str, dict[str, Any]]:
     """Render the additive handoff section, bounded to ``cap`` characters.
 
@@ -2011,7 +2015,11 @@ def _render_handoff(
     cap = _handoff_cap() if cap is None else max(0, cap)
     chunks = [chunk for chunk in state.get("l1_chunks", []) if _belongs(chunk, session)]
     recent = chunks[-_handoff_recent_chunks():]
-    ledger_compact = _handoff_compact(ledger_text)
+    # A bullet is worth its tokens only if the rest of the injection does not
+    # already say it.  ``rest_text`` is the assembled view without this section
+    # (ledger, masters, index lines, live chunks), so this is what makes the
+    # handoff additive rather than a second copy of the transcript.
+    already_shown = _handoff_compact(ledger_text) + _handoff_compact(rest_text)
     sections: dict[str, list[str]] = {key: [] for key in HANDOFF_SECTION_ORDER}
     seen: set[str] = set()
     for chunk in reversed(recent):
@@ -2026,7 +2034,7 @@ def _render_handoff(
                     continue
                 item = str(entry[0])
                 compact = _handoff_compact(item)
-                if not compact or compact in seen or compact in ledger_compact:
+                if not compact or compact in seen or compact in already_shown:
                     continue
                 turn = entry[1] if len(entry) > 1 else "?"
                 sections[key].append(f"{item} (turn {turn})")
@@ -2063,7 +2071,7 @@ def _render_handoff(
                 break
         text = compose()
     if len(text) > cap or not text:
-        return "", {"enabled": _handoff_enabled(), "sections": 0, "chars": 0}
+        return "", {"enabled": _handoff_enabled(), "sections": 0, "items": 0, "chars": 0}
     if _journal_enabled() and len(text) + len(JOURNAL_INSTRUCTION) + 1 <= cap:
         text = text + "\n" + JOURNAL_INSTRUCTION
     return text, {
@@ -4802,21 +4810,20 @@ def injection_payload(
     ledger_len = len(ledger) + 2 if ledger else 0
     # The handoff is additive: it never replaces the ledger, the masters or the
     # active chunks, and it lives in the volatile half of the block so the
-    # cached head stays byte-identical from turn to turn.
+    # cached head stays byte-identical from turn to turn.  It is rendered
+    # *after* the rest is packed -- see below -- because its whole value is
+    # carrying facts the packed view no longer shows.
     handoff_text = ""
+    journal_note = ""
     handoff_meta: dict[str, Any] = {
-        "enabled": _handoff_enabled(), "sections": 0, "chars": 0,
+        "enabled": _handoff_enabled(), "sections": 0, "items": 0, "chars": 0,
     }
-    # Below ~1200 chars the recent turns the handoff summarises are still in
-    # the injection themselves, so the section would cost budget without
-    # adding anything; skip it and let the L3 index keep the space.
+    # Reserve room up front, but render only after packing: packing always
+    # fills the budget, so a section that waits for leftovers would never fit.
+    handoff_reserve = 0
     if _handoff_enabled() and target >= 1_200:
-        handoff_budget = min(_handoff_cap(), max(300, target // 4))
-        handoff_text, handoff_meta = _render_handoff(
-            state, session, ledger, handoff_budget
-        )
-    handoff_reserve = len(handoff_text) + 2 if handoff_text else 0
-    content_cap = max(1, content_cap - handoff_reserve)
+        handoff_reserve = min(_handoff_cap(), max(200, target // 8))
+        content_cap = max(1, content_cap - handoff_reserve)
 
     if not l3_enabled:
         master_blocks = [str(master["block"]) for master in masters]
@@ -4992,6 +4999,8 @@ def injection_payload(
             # The anchor stays last: tail placement exists so the instruction is
             # the last thing read.
             volatile_parts = [handoff_text, index_text, active_text, main, extra_note]
+        if journal_note and journal_note not in volatile_parts:
+            volatile_parts = volatile_parts + [journal_note]
         head = "\n\n".join(part for part in head_parts if part)
         volatile = "\n\n".join(part for part in volatile_parts if part)
         assembled = "\n\n".join(
@@ -5000,6 +5009,26 @@ def injection_payload(
         return assembled, head, volatile
 
     text, head_text, volatile_text = assemble(goal_sections)
+    # Second pass: now that the packed view is known, keep only handoff facts
+    # it lost.  Anything still visible in the ledger, masters, index lines or
+    # live chunks is dropped, so the section cannot be a second copy of text
+    # the model is already reading.  It gets whatever budget is left, and
+    # nothing if that is too little to say something useful.
+    if _handoff_enabled() and target >= 1_200:
+        spare = min(handoff_reserve or _handoff_cap(), cap - len(text) - 4)
+        if spare >= 120:
+            handoff_text, handoff_meta = _render_handoff(
+                state, session, ledger, spare, rest_text=text
+            )
+            if handoff_text:
+                text, head_text, volatile_text = assemble(goal_sections)
+    # The journal prompt must be present from the first turn, when there is
+    # nothing to show yet -- otherwise the model is never asked to emit tags
+    # and the section can never fill.
+    if _journal_enabled() and JOURNAL_INSTRUCTION not in text:
+        if len(text) + len(JOURNAL_INSTRUCTION) + 2 <= cap:
+            journal_note = JOURNAL_INSTRUCTION
+            text, head_text, volatile_text = assemble(goal_sections)
     if len(text) > cap and handoff_text:
         # The handoff yields first: it is the newest section and the least
         # established, while the anchor and the ledger are what the session has
@@ -5729,11 +5758,28 @@ def self_test(verbose: bool = False) -> bool:
     )
     handoff_payload = injection_payload(handoff_probe, max_chars=5_000)
     check(
-        "known-positive: the handoff renders additively beside the ledger",
+        "known-negative: no handoff when the view already shows everything",
         handoff_payload is not None
-        and "Session handoff (key facts)" in handoff_payload["additional_context"]
-        and "**Entity Ledger (pinned):**" in handoff_payload["additional_context"]
-        and handoff_payload["metadata"]["compactor"]["handoff"]["sections"] > 0,
+        and "Session handoff (key facts)" not in handoff_payload["additional_context"]
+        and "**Entity Ledger (pinned):**" in handoff_payload["additional_context"],
+    )
+    demoted = new_state()
+    for index in range(20):
+        append_turn(
+            demoted,
+            (
+                f"Turn {index}: the exporter retries with backoff and the pool "
+                f"sits at {index % 7 + 2} shards while we tune the worker. "
+            ) * 3,
+            llm="off",
+            role="assistant",
+        )
+    demoted_view = injection_payload(demoted, max_chars=2_000)
+    check(
+        "known-positive: the handoff restores facts the packed view dropped",
+        demoted_view is not None
+        and "Session handoff (key facts)" in demoted_view["additional_context"]
+        and demoted_view["metadata"]["compactor"]["handoff"]["items"] > 0,
     )
 
     if verbose:

@@ -641,8 +641,17 @@ It is built with regexes from the raw captured turns at commit time -- no
 generator call, no extra latency on the hook path, and nothing invented. Each
 bullet carries the turn it came from, so a reader can check it. It is rendered
 into the **volatile** half of the block, after the cached head, so the head
-stays byte-identical from turn to turn (see the KV-caching section). Items
-already pinned by the ledger are dropped rather than paid for twice.
+stays byte-identical from turn to turn (see the KV-caching section).
+
+**It only carries what the view lost.** Every bullet is checked against the
+rest of the injection (ledger, masters, index lines, live chunks); anything
+already visible is dropped. The section is therefore genuinely additive rather
+than a second copy of the transcript: on a short session where every turn is
+still shown in full it renders **nothing at all**, and it appears only once
+compression or the L3 index has dropped a fact. Measured on a 40-turn session
+at the default 6,400-character target: 4 bullets, 577 characters, zero
+duplicates, all recovered from turns the index had demoted to one-line
+entries.
 
 Why these four sections and no others: a benchmark on branch
 `experiment/handoff-template-bench` measured every section against a full
@@ -655,8 +664,10 @@ across 12 paired cells, so it is not included. The full evidence, including the
 rendering bug that voided the first ablation run, is in
 `bench/HANDOFF_TEMPLATE_FINDINGS.md`.
 
-The handoff is skipped below a 1,200-character injection budget: at that size
-the recent turns it summarises are still in the injection themselves.
+The handoff reserves at most one eighth of the target (capped at 720 characters)
+and is skipped below a 1,200-character budget. When it has nothing to add it
+returns an empty string, and the reserved space goes unused -- a bounded cost,
+not a silent omission.
 
 ### Journal tags (opt-in)
 

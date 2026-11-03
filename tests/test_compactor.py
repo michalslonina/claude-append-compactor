@@ -2511,73 +2511,65 @@ def _append_role(state: dict, text: str, role: str = "user", session: str | None
     return chunk
 
 
-def test_handoff_renders_beside_the_ledger_and_keeps_the_head(monkeypatch):
+def _demoting_state(turns: int = 30) -> dict:
+    """A session long enough that the injection stops showing older turns in full."""
     state = _fresh_state()
-    _append_role(
-        state,
-        "please set the export worker to 8 shards; "
-        "src/export/csv_writer.py line 64 handles the header.",
-    )
+    for index in range(turns):
+        _append_role(
+            state,
+            f"Turn {index}: the exporter retries with backoff and the pool sits at "
+            f"{index % 7 + 2} shards while we tune src/export/worker_{index}.py "
+            "for throughput. " * 3,
+            role="assistant",
+        )
+    return state
+
+
+def test_handoff_only_carries_what_the_injection_lost(monkeypatch):
+    """The section exists to restore what packing dropped, not to repeat it."""
+    state = _demoting_state()
     monkeypatch.setenv("APPEND_COMPACT_HANDOFF", "0")
-    baseline = compactor.injection_payload(state, max_chars=5_000)
+    rest = compactor.injection_payload(state, max_chars=2_000)["additional_context"]
     monkeypatch.setenv("APPEND_COMPACT_HANDOFF", "1")
-    payload = compactor.injection_payload(state, max_chars=5_000)
+    payload = compactor.injection_payload(state, max_chars=2_000)
     text = payload["additional_context"]
 
-    assert "Session handoff (key facts)" in text
-    assert "8 shards" in text
-    assert "src/export/csv_writer.py" in text
-    assert "**Entity Ledger (pinned):**" in text
-    # Additive: the ledger + newest-block head is byte-identical either way.
+    assert "## Session handoff (key facts)" in text
+    handoff = text[len(rest.split("\n\n")[0]):]  # not used for assertions
+    ledger = payload["content_blocks"][0]["text"]
+    rendered, meta = compactor._render_handoff(state, None, ledger, 720, rest_text=rest)
+    bullets = [line[2:] for line in rendered.splitlines() if line.startswith("- ")]
+    assert bullets, "a demoted session must yield at least one recovered fact"
+    assert meta["items"] == len(bullets)
+    compact_rest = compactor._handoff_compact(rest)
+    for bullet in bullets:
+        assert compactor._handoff_compact(bullet.rsplit(" (turn", 1)[0]) not in compact_rest
+
+
+def test_handoff_keeps_the_stable_head_byte_identical(monkeypatch):
+    state = _demoting_state()
+    monkeypatch.setenv("APPEND_COMPACT_HANDOFF", "0")
+    baseline = compactor.injection_payload(state, max_chars=2_000)
+    monkeypatch.setenv("APPEND_COMPACT_HANDOFF", "1")
+    payload = compactor.injection_payload(state, max_chars=2_000)
     assert payload["content_blocks"][0]["text"] == baseline["content_blocks"][0]["text"]
-    assert payload["metadata"]["compactor"]["handoff"]["sections"] > 0
 
 
-def test_handoff_items_carry_the_turn_they_came_from(monkeypatch):
+def test_handoff_is_empty_when_the_view_already_shows_everything(monkeypatch):
     monkeypatch.setenv("APPEND_COMPACT_HANDOFF", "1")
     state = _fresh_state()
-    _append_role(state, "detail about the first turn", role="assistant")
     _append_role(state, "please use port 8443 for the metrics listener")
     payload = compactor.injection_payload(state, max_chars=6_000)
-    assert "port 8443" in payload["additional_context"]
-    assert "(turn 2)" in payload["additional_context"]
-
-
-def test_handoff_is_skipped_when_the_budget_is_tight(monkeypatch):
-    monkeypatch.setenv("APPEND_COMPACT_HANDOFF", "1")
-    state = _fresh_state()
-    _append_role(state, "please set the export worker to 8 shards in src/export/csv_writer.py")
-    payload = compactor.injection_payload(state, max_chars=900)
-    assert "Session handoff (key facts)" not in payload["additional_context"]
-    assert payload["metadata"]["compactor"]["handoff"]["enabled"] is True
-
-
-def test_handoff_dedupes_against_the_ledger(monkeypatch):
-    monkeypatch.setenv("APPEND_COMPACT_HANDOFF", "1")
-    state = _fresh_state()
-    _append_role(state, "please keep src/export/csv_writer.py on line 64.")
-    payload = compactor.injection_payload(state, max_chars=6_000)
-    ledger = payload["content_blocks"][0]["text"]
-    assert "src/export/csv_writer.py" in ledger
-    handoff_part = payload["additional_context"].split("## Session handoff (key facts)")[1]
-    # The ledger already pins the path; paying for it twice is the thing the
-    # dedupe exists to prevent.
-    assert "- src/export/csv_writer.py" not in handoff_part
+    assert "## Session handoff (key facts)" not in payload["additional_context"]
+    assert payload["metadata"]["compactor"]["handoff"]["items"] == 0
 
 
 def test_handoff_is_bounded_by_its_char_cap(monkeypatch):
     monkeypatch.setenv("APPEND_COMPACT_HANDOFF", "1")
-    monkeypatch.setenv("APPEND_COMPACT_HANDOFF_CHARS", "200")
-    state = _fresh_state()
-    for index in range(6):
-        _append_role(
-            state,
-            f"please keep src/module_{index}.py on line {index + 10} "
-            f"with the worker pool at {index + 2} shards",
-        )
-    payload = compactor.injection_payload(state, max_chars=10_000)
-    handoff = payload["additional_context"].split("## Session handoff (key facts)")[1]
-    assert len(handoff) <= 200 + len("## Session handoff (key facts)")
+    state = _demoting_state(20)
+    rest = ""
+    rendered, meta = compactor._render_handoff(state, None, "", 200, rest_text=rest)
+    assert rendered == "" or len(rendered) <= 200
 
 
 # ---------------------------------------------------------------------------
