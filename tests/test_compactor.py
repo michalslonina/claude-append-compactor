@@ -1057,6 +1057,51 @@ def test_transcript_tool_results_are_captured_and_condensed(tmp_path):
     assert len(tool_turns[0]) <= compactor.TOOL_RESULT_CHARS
 
 
+def _append_compact_boundary(path: Path, timestamp: str) -> None:
+    record = {"type": "system", "subtype": "compact_boundary", "timestamp": timestamp}
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record) + "\n")
+
+
+def _armed_prompt(state, transcript: Path):
+    args = Namespace(prompt="continue", force_inject=False, inject=True)
+    return compactor.handle_prompt_event(
+        state,
+        {"session_id": "session-1", "prompt": "continue", "transcript_path": str(transcript)},
+        args,
+    )
+
+
+def test_prompt_skips_injection_when_compaction_did_not_finish(tmp_path):
+    transcript = tmp_path / "transcript.jsonl"
+    _write_transcript(transcript)
+    state = _fresh_state()
+    compactor.handle_precompact_event(
+        state, {"session_id": "session-1", "transcript_path": str(transcript)}, Namespace()
+    )
+    state["armed_sessions"]["session-1"]["at"] = "2026-11-03T16:48:47Z"
+    _append_compact_boundary(transcript, "2026-11-03T16:43:11.108Z")
+
+    assert _armed_prompt(state, transcript) is None
+    assert "session-1" not in state["armed_sessions"]
+
+
+def test_prompt_injects_when_compaction_finished_after_arm(tmp_path):
+    transcript = tmp_path / "transcript.jsonl"
+    _write_transcript(transcript)
+    state = _fresh_state()
+    compactor.handle_precompact_event(
+        state, {"session_id": "session-1", "transcript_path": str(transcript)}, Namespace()
+    )
+    state["armed_sessions"]["session-1"]["at"] = "2026-11-03T16:41:02Z"
+    _append_compact_boundary(transcript, "2026-11-03T16:43:11.108Z")
+
+    injected = _armed_prompt(state, transcript)
+    assert injected is not None
+    assert "src/app.ts" in injected["hookSpecificOutput"]["additionalContext"]
+    assert "session-1" not in state["armed_sessions"]
+
+
 def test_sessionstart_injects_armed_session_once_and_disarms():
     state = _state_with_master_and_active(session="s1")
     state.setdefault("armed_sessions", {})["s1"] = {"armed": True}

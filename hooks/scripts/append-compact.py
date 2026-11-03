@@ -5421,6 +5421,48 @@ def _record_injection_stats(event: str, session: str, output: dict[str, Any] | N
         return
 
 
+COMPACT_BOUNDARY_TAIL_BYTES = 8 * 1024 * 1024
+
+
+def _parse_utc(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _compacted_since(transcript_path: Any, since: Any) -> bool | None:
+    """True/False when the transcript shows whether a compaction finished after
+    ``since``; None when that cannot be determined."""
+    since_at = _parse_utc(since)
+    if not transcript_path or since_at is None:
+        return None
+    path = Path(str(transcript_path)).expanduser()
+    try:
+        with path.open("rb") as fh:
+            size = fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, size - COMPACT_BOUNDARY_TAIL_BYTES))
+            tail = fh.read()
+    except OSError:
+        return None
+    for line in reversed(tail.splitlines()):
+        if b'"compact_boundary"' not in line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(record, dict) or record.get("subtype") != "compact_boundary":
+            continue
+        at = _parse_utc(record.get("timestamp"))
+        if at is not None and at >= since_at:
+            return True
+    return False
+
+
 def handle_prompt_event(
     state: dict[str, Any],
     payload: dict[str, Any],
@@ -5433,7 +5475,15 @@ def handle_prompt_event(
     if not isinstance(prompt, str) or not prompt.strip():
         return None
 
-    armed = bool(state.get("armed_sessions", {}).get(session))
+    arm = state.get("armed_sessions", {}).get(session)
+    armed = bool(arm)
+    if armed and not args.force_inject:
+        arm_at = arm.get("at") if isinstance(arm, dict) else None
+        if _compacted_since(payload.get("transcript_path"), arm_at) is False:
+            # PreCompact armed the session but no compaction followed, so the
+            # full context is still in place.
+            state.get("armed_sessions", {}).pop(session, None)
+            armed = False
     output = None
     if args.force_inject or armed:
         # Build context from history *before* appending the current prompt, so
