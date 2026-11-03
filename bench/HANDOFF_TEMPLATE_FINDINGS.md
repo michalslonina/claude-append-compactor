@@ -317,10 +317,48 @@ The `on` arm either names the component or quotes the recovered sentence back
 (`"Please add a retry cap to the importer before the migration."`), which is the
 handoff bullet being read rather than guessed.
 
-**What this does not settle.** One 7B model, n=6, one sample per cell, synthetic
-sessions, and questions that name the fact type. It does not show that a
-stronger model — which may already widen its search — gains the same; a
-strong-model arm was not run. Nor does it price the risk of a wrong bullet:
+### Strong arms — the gain is model-dependent, and the failure mode is fluent
+
+The same six scenarios and five arms against two stronger models:
+
+| model | `none` | `off` | `sham` | `on` | `full` |
+|---|--:|--:|--:|--:|--:|
+| `qwen2.5:7b` | 0/6 | **0/6** | 0/6 | 6/6 | 6/6 |
+| `qwen3.5:latest` | 0/6 | **0/6** | 0/6 | 6/6 | 6/6 |
+| `deepseek-flash` | 0/6 | **3/6** | 4/6 | 6/6 | 6/6 |
+
+Two of the three cannot use the packed view at all; the third gets half way. Per
+scenario for DeepSeek:
+
+| scenario | off | sham | on | off-arm answer |
+|---|--:|--:|--:|---|
+| `csv_writer` | ✓ | ✓ | ✓ | "legacy CSV writer" |
+| `flush_daemon` | ✓ | ✓ | ✓ | "flush daemon" |
+| `retry_cap` | ✓ | ✓ | ✓ | "a retry cap" |
+| `signing_keystore` | ✗ | ✓ | ✓ | "keystore signing key" |
+| `manifest_loader` | ✗ | ✗ | ✓ | "legacy loader" |
+| `batch_prefetcher` | ✗ | ✗ | ✓ | "prefetcher" |
+
+The control that makes this interpretable is a **keyword trace**: the L3 index
+keeps the answer's words (`migration., legacy, writer, drop, csv`) but not the
+sentence. A strong model can rebuild "legacy CSV writer" from that list; the two
+smaller ones read the same list and answer `"cobalt"`, `"writer"`, `"remove"` or
+the literal fragment string. So off-arm hits are reconstruction, not guessing,
+and they are recorded rather than failed. Measured directly, every answer term is
+present in every off injection; the difference is entirely in the model.
+
+The interesting failure is `manifest_loader`: without the handoff DeepSeek answers
+**"legacy loader"** — confidently, fluently, and wrong, because the index kept
+`legacy` and `loader` but not `manifest`. One cell (`signing_keystore`) flips
+between `off` and `sham` at temperature 0, so the DeepSeek baseline is 3.5/6 with
+a one-cell wobble, not a stable 3.
+
+So the handoff's value is not uniform: **0→6 for models that cannot decompress the
+index, and +2.5/6 for a model that can.** For a strong model the section is worth
+its 140 characters mainly where a near-miss would otherwise be fluent and wrong.
+
+**What this does not settle.** n=6, one sample per cell, synthetic sessions, and
+questions that name the fact type. Nor does it price the risk of a wrong bullet:
 every bullet here was a verbatim copy, and the pool of questions a user actually
 asks is wider than "what did I ask you to drop".
 

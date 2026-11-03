@@ -63,8 +63,16 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "hooks" / "scripts" / "append-compact.py"
 
+PROVIDER = os.environ.get("HC_BENCH_PROVIDER", "ollama").strip().lower()
 OLLAMA = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-MODEL = os.environ.get("HC_BENCH_MODEL", "qwen2.5:7b")
+MODEL = os.environ.get(
+    "HC_BENCH_MODEL", "deepseek-flash" if PROVIDER == "deepseek" else "qwen2.5:7b"
+)
+DEEPSEEK_URL = os.environ.get("DEEPSEEK_URL", "https://api.deepseek.com/chat/completions")
+DEEPSEEK_ENV = Path.home() / ".config/model-router/env"
+# deepseek-flash bills reasoning tokens against max_tokens, so a small budget
+# gets spent thinking and the JSON body is cut off.
+REASONING_HEADROOM = int(os.environ.get("HC_BENCH_REASONING_HEADROOM", "3000"))
 MAX_CHARS = int(os.environ.get("HC_BENCH_MAX_CHARS", "6400"))
 DEPTH = int(os.environ.get("HC_BENCH_DEPTH", "45"))
 
@@ -228,6 +236,74 @@ def full_transcript(mod, scenario: dict[str, Any], plant_at: int) -> str:
 # Model and scoring
 # ---------------------------------------------------------------------------
 
+def _post_ollama(messages: list[dict[str, str]], *, attempt: int = 0) -> tuple[str, float]:
+    body = json.dumps(
+        {
+            "model": MODEL,
+            "messages": messages,
+            "temperature": 0,
+            "stream": False,
+            "format": "json",
+            # Thinking models spend the whole output budget in the reasoning
+            # block and return an empty ``content``; the probe reads content.
+            "think": False,
+            "options": {
+                "num_predict": 300 * (1.5 ** min(attempt, 3)),
+                "num_ctx": 8192,
+                "seed": 42 + attempt,
+            },
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        f"{OLLAMA}/api/chat", data=body, headers={"Content-Type": "application/json"}
+    )
+    started = time.perf_counter()
+    with urllib.request.urlopen(request, timeout=600) as response:
+        payload = json.load(response)
+    message = payload.get("message") or {}
+    content = (message.get("content") or "").strip()
+    if not content and (message.get("thinking") or payload.get("done_reason") == "length"):
+        raise ValueError("empty content (thinking model spent the budget reasoning)")
+    return content, time.perf_counter() - started
+
+
+def _deepseek_key() -> str:
+    key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if key:
+        return key
+    if DEEPSEEK_ENV.exists():
+        for line in DEEPSEEK_ENV.read_text(encoding="utf-8").splitlines():
+            if line.startswith("DEEPSEEK_API_KEY="):
+                return line.split("=", 1)[1].strip().strip("\"'")
+    raise RuntimeError("DEEPSEEK_API_KEY not found")
+
+
+def _post_deepseek(messages: list[dict[str, str]], *, attempt: int = 0) -> tuple[str, float]:
+    body = {
+        "model": MODEL,
+        "messages": messages,
+        "temperature": 0,
+        "max_tokens": 200 + REASONING_HEADROOM * (2 ** min(attempt, 4)),
+        "stream": False,
+        "response_format": {"type": "json_object"},
+    }
+    request = urllib.request.Request(
+        DEEPSEEK_URL,
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {_deepseek_key()}",
+        },
+    )
+    started = time.perf_counter()
+    with urllib.request.urlopen(request, timeout=300) as response:
+        payload = json.load(response)
+    choice = (payload.get("choices") or [{}])[0]
+    if choice.get("finish_reason") == "length":
+        raise ValueError("deepseek response truncated")
+    return str((choice.get("message") or {}).get("content") or ""), time.perf_counter() - started
+
+
 def ask(context: str, scenario: dict[str, Any], which: str) -> dict[str, Any]:
     """One fact per call.
 
@@ -237,29 +313,24 @@ def ask(context: str, scenario: dict[str, Any], which: str) -> dict[str, Any]:
     """
     question = scenario["target_q"] if which == "target" else scenario["canary_q"]
     user = f'Context:\n\n{context}\n\nQuestion: report the {question}. Answer as JSON: {{"value": ...}}.'
-    body = json.dumps(
-        {
-            "model": MODEL,
-            "messages": [
-                {"role": "system", "content": SYSTEM},
-                {"role": "user", "content": user},
-            ],
-            "temperature": 0,
-            "stream": False,
-            "format": "json",
-            "options": {"num_predict": 200, "num_ctx": 8192, "seed": 42},
-        }
-    ).encode("utf-8")
-    request = urllib.request.Request(
-        f"{OLLAMA}/api/chat",
-        data=body,
-        headers={"Content-Type": "application/json"},
-    )
-    started = time.perf_counter()
-    with urllib.request.urlopen(request, timeout=600) as response:
-        payload = json.load(response)
-    raw = (payload.get("message") or {}).get("content") or ""
-    latency = time.perf_counter() - started
+    messages = [
+        {"role": "system", "content": SYSTEM},
+        {"role": "user", "content": user},
+    ]
+    attempt = 0
+    while True:
+        try:
+            if PROVIDER == "deepseek":
+                raw, latency = _post_deepseek(messages, attempt=attempt)
+            elif PROVIDER == "ollama":
+                raw, latency = _post_ollama(messages, attempt=attempt)
+            else:
+                raise RuntimeError(f"unknown HC_BENCH_PROVIDER={PROVIDER!r}")
+            break
+        except (ValueError, urllib.error.URLError, TimeoutError):
+            attempt += 1
+            if attempt > 3:
+                raise
     try:
         parsed = json.loads(raw)
     except ValueError:
@@ -275,7 +346,10 @@ def scored(answer: Any, regex: str) -> bool:
     """
     if answer is None:
         return False
-    return re.search(regex, json.dumps(answer) if not isinstance(answer, str) else answer) is not None
+    text = json.dumps(answer) if not isinstance(answer, str) else answer
+    # Case-insensitive: a capable model answers "legacy CSV writer" for a
+    # scenario keyed on "csv writer", which is the right answer, not a miss.
+    return re.search(regex, text, re.IGNORECASE) is not None
 
 
 def pick_plant_turn(mod, scenario: dict[str, Any]) -> tuple[int, dict[str, bool]]:
@@ -391,6 +465,18 @@ def main(argv: list[str] | None = None) -> int:
         if not delivery:
             print(f"[control FAIL] {scenario['name']}: handoff did not deliver the target", file=sys.stderr)
             return 3
+        # A capable model can rebuild an ask from the L3 index's keyword list
+        # ("keystore, signing") even though the sentence is gone.  Record
+        # whether every content word of the ask is still visible somewhere in
+        # the packed view: a hit there is reconstruction, not a guess.
+        # The answer's own terms, not the sentence's function words: the L3
+        # index keeps "csv, writer" but drops "should" and "before", and it is
+        # the answer terms that decide whether the model could rebuild it.
+        trace_terms = [t for t in re.sub(r"\\b", "", scenario["target_re"]).split() if t]
+        traced = bool(trace_terms) and all(
+            re.search(re.escape(term), arms["off"], re.IGNORECASE) for term in trace_terms
+        )
+        controls.append({"scenario": scenario["name"], "keyword_trace": traced})
         for arm, context in arms.items():
             target = ask(context, scenario, "target")
             canary = ask(context, scenario, "canary")
@@ -402,6 +488,7 @@ def main(argv: list[str] | None = None) -> int:
                     "context_chars": len(context),
                     "target_ok": scored(target["parsed"], scenario["target_re"]),
                     "canary_ok": scored(canary["parsed"], scenario["canary_re"]),
+                    "keyword_trace": traced,
                     "target_raw": target["raw"][:300],
                     "canary_raw": canary["raw"][:300],
                     "latency_s": round(target["latency_s"] + canary["latency_s"], 1),
@@ -432,8 +519,8 @@ def main(argv: list[str] | None = None) -> int:
     # is trying to measure.
     for arm in ("off", "sham"):
         for row in by_arm.get(arm, []):
-            if row["target_ok"]:
-                failures.append(f"target produced without it in context ({arm}): {row['scenario']}")
+            if row["target_ok"] and not row["keyword_trace"]:
+                failures.append(f"target produced with no trace in context ({arm}): {row['scenario']}")
     for arm, arm_rows in by_arm.items():
         if arm == "none":
             continue
@@ -441,7 +528,12 @@ def main(argv: list[str] | None = None) -> int:
         if missed:
             failures.append(f"canary miss in arm {arm}: {', '.join(missed)}")
 
-    summary: dict[str, Any] = {"model": MODEL, "depth": DEPTH, "max_chars": MAX_CHARS}
+    summary: dict[str, Any] = {
+        "provider": PROVIDER,
+        "model": MODEL,
+        "depth": DEPTH,
+        "max_chars": MAX_CHARS,
+    }
     for arm, arm_rows in by_arm.items():
         summary[arm] = {
             "n": len(arm_rows),
