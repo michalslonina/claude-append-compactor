@@ -6,7 +6,7 @@
   },
   "metadata": {
     "description": "Multilevel append-only context compactor with LLMLingua-2, line-level code minification, and entity pinning for Claude Code",
-    "version": "1.6.0"
+    "version": "1.10.0"
   },
   "plugins": [
     {

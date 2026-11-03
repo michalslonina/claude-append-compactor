@@ -26,12 +26,15 @@ known-negative controls used by the compression pipeline.
 from __future__ import annotations
 
 import argparse
+import ast
 import contextlib
 import hashlib
 import inspect
 import json
+import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -49,7 +52,7 @@ except ImportError:  # pragma: no cover - Windows fallback
     fcntl = None  # type: ignore[assignment]
 
 
-VERSION = "1.6.0"
+VERSION = "1.10.0"
 SCHEMA_VERSION = 1
 PLUGIN_NAME = "claude-append-compactor"
 
@@ -85,6 +88,48 @@ DEFAULT_PRECOMPACT_CHARS = 24_000
 MIN_PROSE_CHARS = 160
 L2_DIGEST_CHARS = 480
 ENTITY_HEADER_LIMIT = 200
+
+# L3 placeholders.  Older L1 chunks and L2 masters stay recoverable through a
+# content-addressed file and a one-line index entry, while the newest material
+# is injected in full.  The index is always after the pinned ledger, so the
+# stable head of the injected block never moves.  This is deliberately a view:
+# no stored chunk or master is ever rewritten, and no conversation message is
+# touched, which is what keeps provider prefix caches useful (see README).
+DEFAULT_L3_TARGET_CHARS = 6_400
+DEFAULT_L3_KEEP_RECENT_MASTERS = 3
+DEFAULT_L3_KEEP_RECENT_CHUNKS = 2
+DEFAULT_L3_DRIFT_KEEP_RECENT_MASTERS = 1
+DEFAULT_L3_DRIFT_KEEP_RECENT_CHUNKS = 1
+DEFAULT_L3_INDEX_BUDGET_CHARS = 4_000
+DEFAULT_L3_SUMMARY_CHARS = 80
+DEFAULT_L3_KEYWORDS = 7
+DEFAULT_L3_ENTITY_CHARS = 72
+DEFAULT_L3_DRIFT_WINDOW = 4
+DEFAULT_L3_DRIFT_MIN_TOKENS = 8
+DEFAULT_L3_DRIFT_THRESHOLD = 0.12
+DEFAULT_L3_MAX_FILES = 4_096
+# L3 blocks are stored as zstd --ultra -22 files.  The agent can scan them
+# without decompressing to disk: `ugrep -z PATTERN FILE` or `zstdgrep PATTERN
+# FILE`.  Level 22 is the maximum zstd level; >19 requires --ultra.
+DEFAULT_L3_ZSTD_LEVEL = 22
+
+# Goal / vision / strategy anchors.  Goals are extracted deterministically
+# from user-authored turns and kept as a versioned, session-scoped state.  The
+# anchor is rendered only into the *current* injection, never into a stored L1
+# chunk, L2 master or conversation message, so a goal revision cannot rewrite
+# history.  The defaults are deliberately conservative: the feature is off
+# until measured in a deployment (see README "Goal anchors").
+GOAL_STATE_SCHEMA = 1
+DEFAULT_GOAL_ANCHOR_L1_CHARS = 240
+DEFAULT_GOAL_ANCHOR_L2_CHARS = 520
+DEFAULT_GOAL_ANCHOR_L3_CHARS = 760
+DEFAULT_GOAL_ANCHOR_MAX_CHARS = 900
+DEFAULT_GOAL_ANCHOR_HYBRID_CHARS = 520
+DEFAULT_GOAL_REMINDER_CHARS = 160
+DEFAULT_GOAL_MAX_ITEMS = 8
+GOAL_ITEM_LIMIT = 48
+GOAL_SOURCE_LIMIT = 64
+GOAL_HISTORY_LIMIT = 64
 
 # Background compaction.  Hooks enqueue raw turns and return immediately; a
 # small, machine-wide pool of detached workers compresses them outside the hook
@@ -140,6 +185,16 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         return default
     return value if value > 0 else default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError:
+        return default
 
 
 def default_state_path() -> Path:
@@ -227,6 +282,23 @@ def _atomic_write_json(path: Path, data: Any) -> None:
         raise
 
 
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, path)
+        with contextlib.suppress(OSError):
+            os.chmod(path, 0o600)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
+
+
 def _atomic_write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
@@ -257,12 +329,316 @@ def _cache_enabled() -> bool:
     return _env_bool("APPEND_COMPACT_CACHE", True)
 
 
-def _compress_cache_key(text: str, rate: float, model: str) -> str:
+def _compress_cache_key(text: str, rate: float, model: str, variant: str = "") -> str:
     digest = hashlib.sha256()
     digest.update(f"append-compactor/compressed/v{COMPRESS_CACHE_SCHEMA}\0".encode("utf-8"))
     digest.update(f"rate={rate:g}\0model={model}\0".encode("utf-8"))
+    # Only non-default strategies add a marker, so existing cache entries stay
+    # valid when sentence protection is off.
+    if variant:
+        digest.update(f"variant={variant}\0".encode("utf-8"))
     digest.update(text.encode("utf-8"))
     return digest.hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Raw-text archive
+#
+# Compaction is lossy.  Archiving the pre-compression turn makes every loss
+# recoverable with ``--recall <id>`` while keeping the state file bounded.
+# Files are content-addressed and pruned oldest-first at a fixed cap, so a long
+# session cannot grow the cache without bound.
+# ---------------------------------------------------------------------------
+
+_RAW_ID_RE = re.compile(r"^[0-9a-f]{12,64}$")
+
+
+def _raw_enabled() -> bool:
+    return _env_bool("APPEND_COMPACT_RAW", True)
+
+
+def _raw_dir() -> Path:
+    configured = os.environ.get("APPEND_COMPACT_RAW_DIR")
+    return Path(configured).expanduser() if configured else default_cache_dir() / "raw"
+
+
+def _raw_max_files() -> int:
+    return max(1, _env_int("APPEND_COMPACT_RAW_MAX_FILES", 4096))
+
+
+def _prune_raw_archive() -> None:
+    root = _raw_dir()
+    limit = _raw_max_files()
+    try:
+        files = [path for path in root.glob("*/*.txt") if path.is_file()]
+    except OSError:
+        return
+    if len(files) <= limit:
+        return
+    try:
+        files.sort(key=lambda path: path.stat().st_mtime)
+    except OSError:
+        return
+    for path in files[: len(files) - limit]:
+        with contextlib.suppress(OSError):
+            path.unlink()
+
+
+def archive_raw(text: str) -> str | None:
+    """Store ``text`` under its SHA-256 and return the id, or None if disabled."""
+    if not _raw_enabled() or not text:
+        return None
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    path = _raw_dir() / digest[:2] / f"{digest}.txt"
+    if not path.exists():
+        try:
+            _atomic_write_text(path, text)
+        except OSError as exc:
+            _log_error(f"raw archive write failed: {exc!r}")
+            return None
+        _prune_raw_archive()
+    return digest
+
+
+def recall_raw(raw_id: str) -> str | None:
+    """Return the archived text for a full id or a >=12 hex prefix.
+
+    The content hash is re-verified against the id, so a truncated, edited or
+    misplaced cache file is refused rather than returned as the original.
+    """
+    raw_id = raw_id.strip().lower()
+    if not _RAW_ID_RE.fullmatch(raw_id):
+        return None
+    root = _raw_dir() / raw_id[:2]
+    candidates = (
+        [root / f"{raw_id}.txt"]
+        if len(raw_id) == 64
+        else sorted(root.glob(f"{raw_id}*.txt"))
+    )
+    for path in candidates:
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if hashlib.sha256(content.encode("utf-8")).hexdigest().startswith(raw_id):
+            return content
+    return None
+
+
+def _raw_file_display(raw_id: str) -> str:
+    """Absolute raw-archive path, abbreviated with ``~`` when under $HOME."""
+    path = _raw_dir() / raw_id[:2] / f"{raw_id}.txt"
+    text = str(path)
+    home = str(Path.home())
+    if text.startswith(home + os.sep):
+        return "~" + text[len(home):]
+    return text
+
+
+# ---------------------------------------------------------------------------
+# L3 view archive
+#
+# L3 never deletes a chunk.  It stores the exact rendered chunk/master block in
+# a content-addressed file and injects a short index line instead.  The file is
+# verified against its id on recall, so an edited or truncated cache entry is
+# refused rather than presented as the original.
+# ---------------------------------------------------------------------------
+
+_L3_ID_RE = re.compile(r"^[0-9a-f]{12,64}$")
+_L3_ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+
+
+def _l3_enabled() -> bool:
+    return _env_bool("APPEND_COMPACT_L3", True)
+
+
+def _l3_dir() -> Path:
+    configured = os.environ.get("APPEND_COMPACT_L3_DIR")
+    return Path(configured).expanduser() if configured else default_cache_dir() / "l3"
+
+
+def _l3_max_files() -> int:
+    return max(1, _env_int("APPEND_COMPACT_L3_MAX_FILES", DEFAULT_L3_MAX_FILES))
+
+
+def _l3_zstd_level() -> int:
+    return max(1, min(22, _env_int("APPEND_COMPACT_L3_ZSTD_LEVEL", DEFAULT_L3_ZSTD_LEVEL)))
+
+
+def _l3_compress_enabled() -> bool:
+    return (
+        _env_bool("APPEND_COMPACT_L3_COMPRESS", True)
+        and shutil.which("zstd") is not None
+    )
+
+
+def _l3_zstd_args(level: int) -> list[str]:
+    args = ["zstd"]
+    if level > 19:
+        args.append("--ultra")
+    args.extend([f"-{level}", "-q", "-c"])
+    return args
+
+
+def _compress_l3_block(block: str, level: int) -> bytes:
+    proc = subprocess.run(
+        _l3_zstd_args(level),
+        input=block.encode("utf-8"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=60,
+    )
+    if proc.returncode != 0:
+        detail = proc.stderr.decode("utf-8", "replace").strip()[:200]
+        raise OSError(f"zstd failed ({proc.returncode}): {detail}")
+    return proc.stdout
+
+
+def _read_l3_file(path: Path) -> str | None:
+    if path.suffix == ".zst":
+        try:
+            proc = subprocess.run(
+                ["zstd", "-d", "-q", "-c", str(path)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=60,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if proc.returncode != 0:
+            return None
+        try:
+            return proc.stdout.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def _prune_l3_archive() -> None:
+    root = _l3_dir()
+    limit = _l3_max_files()
+    try:
+        files = [
+            path
+            for pattern in ("*/*.txt.zst", "*/*.txt")
+            for path in root.glob(pattern)
+            if path.is_file()
+        ]
+    except OSError:
+        return
+    if len(files) <= limit:
+        return
+    try:
+        files.sort(key=lambda path: path.stat().st_mtime)
+    except OSError:
+        return
+    for path in files[: len(files) - limit]:
+        with contextlib.suppress(OSError):
+            path.unlink()
+
+
+def l3_id_for(block: str) -> str:
+    return hashlib.sha256(block.encode("utf-8")).hexdigest()
+
+
+def _l3_path(block_id: str, compressed: bool | None = None) -> Path:
+    # A 64-bit prefix keeps file links short; recall still verifies the full
+    # SHA-256 of the stored bytes, so a shortened name is not a shortened id.
+    if compressed is None:
+        compressed = _l3_compress_enabled()
+    suffix = ".txt.zst" if compressed else ".txt"
+    return _l3_dir() / block_id[:2] / f"{block_id[:16]}{suffix}"
+
+
+def archive_l3(block: str, block_id: str | None = None) -> str | None:
+    """Store a zstd --ultra -22 block and return its content id.
+
+    ``block_id`` lets the caller compute the id (and therefore the stable path)
+    before deciding which index entries fit the budget.  The write itself only
+    happens for selected entries.
+    """
+    if not block:
+        return None
+    block_id = block_id or l3_id_for(block)
+    compressed = _l3_compress_enabled()
+    path = _l3_path(block_id, compressed=compressed)
+    if path.exists():
+        existing = _read_l3_file(path)
+        if existing is not None and hashlib.sha256(
+            existing.encode("utf-8")
+        ).hexdigest() == block_id:
+            return block_id
+        _log_error(f"L3 archive name collision for {block_id[:16]}")
+        return None
+    try:
+        if compressed:
+            _atomic_write_bytes(path, _compress_l3_block(block, _l3_zstd_level()))
+        else:
+            _atomic_write_text(path, block)
+    except (OSError, subprocess.SubprocessError) as exc:
+        _log_error(f"L3 archive write failed: {exc!r}")
+        return None
+    _prune_l3_archive()
+    return block_id
+
+
+def recall_l3(block_id: str) -> str | None:
+    """Return a verified full block for a full id or a >=12 hex prefix."""
+    block_id = block_id.strip().lower()
+    if not _L3_ID_RE.fullmatch(block_id):
+        return None
+    root = _l3_dir() / block_id[:2]
+    prefix = block_id[:16] if len(block_id) > 16 else block_id
+    candidates = sorted({
+        path
+        for pattern in (f"{prefix}*.txt.zst", f"{prefix}*.txt")
+        for path in root.glob(pattern)
+    })
+    for path in candidates:
+        content = _read_l3_file(path)
+        if content is None:
+            continue
+        if hashlib.sha256(content.encode("utf-8")).hexdigest().startswith(block_id):
+            return content
+    return None
+
+
+def _l3_file_display(block_id: str) -> str:
+    """Absolute L3-archive path, abbreviated with ``~`` when under $HOME."""
+    text = str(_l3_path(block_id))
+    home = str(Path.home())
+    if text.startswith(home + os.sep):
+        return "~" + text[len(home):]
+    return text
+
+
+def _l3_base_display() -> str:
+    """L3 archive root, abbreviated with ``~`` when under $HOME."""
+    text = str(_l3_dir())
+    home = str(Path.home())
+    if text.startswith(home + os.sep):
+        return "~" + text[len(home):]
+    return text
+
+
+def _l3_file_link(block_id: str) -> str:
+    """Short link relative to the archive root (the header names the root)."""
+    suffix = ".txt.zst" if _l3_compress_enabled() else ".txt"
+    return f"{block_id[:2]}/{block_id[:16]}{suffix}"
+
+
+def _is_l3_archive_path(value: str) -> bool:
+    """True for internal ``~/.cache/append-compactor/l3/...`` pointers."""
+    normalized = value.replace("\\", "/")
+    root = _l3_dir().as_posix()
+    home = Path.home().as_posix()
+    prefixes = {root}
+    if root.startswith(home + "/"):
+        prefixes.add("~" + root[len(home):])
+    return any(normalized == prefix or normalized.startswith(prefix + "/") for prefix in prefixes)
 
 
 def _read_cached_compression(path: Path) -> tuple[str, str] | None:
@@ -308,6 +684,17 @@ def _prune_compression_cache(root: Path) -> None:
 # State
 # ---------------------------------------------------------------------------
 
+def new_goal_store() -> dict[str, Any]:
+    """Empty goal state.
+
+    Goals are stored per Claude Code session.  The store is additive: old
+    items are never deleted on a revision, only marked ``superseded`` or
+    ``completed``, so the anchor's provenance and version history survive a
+    later extraction error.
+    """
+    return {"schema": GOAL_STATE_SCHEMA, "sessions": {}}
+
+
 def new_state() -> dict[str, Any]:
     return {
         "schema": SCHEMA_VERSION,
@@ -318,6 +705,7 @@ def new_state() -> dict[str, Any]:
         "armed_sessions": {},
         "recent_captures": [],
         "prompt_seen": {},
+        "goals": new_goal_store(),
         "stats": {
             "turns": 0,
             "bytes_in": 0,
@@ -377,6 +765,7 @@ def load_state(path: Path | None = None) -> dict[str, Any]:
         if isinstance(value, (int, float))
     }
     _cap_prompt_seen(data)
+    data["goals"] = _sanitize_goal_store(data.get("goals"))
     if not isinstance(data.get("stats"), dict):
         data["stats"] = base["stats"]
     return data
@@ -460,8 +849,1240 @@ def status_of(
 
 
 # ---------------------------------------------------------------------------
-# Entity and path pinning
+# Goal / vision / strategy state and render-time anchors
 # ---------------------------------------------------------------------------
+#
+# Design constraints, in priority order:
+#
+# 1. Never rewrite an L1 chunk, an L2 master or a conversation message.  The
+#    anchor is built fresh inside injection_payload().  With the default
+#    beginning placement it leads the stable prefix; with tail/per-level
+#    placement the ledger + masters prefix is byte-identical whether goals are
+#    off, on, or revised.
+# 2. Keep the user's words.  The deterministic extractor copies clauses and
+#    bullet text; it never paraphrases.  Only the budget fallback truncates.
+# 3. Make revisions deliberate and visible.  A revision supersedes the previous
+#    active item and increments the session's anchor version; history is kept.
+# 4. Keep the anchor small and measurable.  Per-level caps plus one hard total
+#    cap bound the added characters; the injection metadata reports the exact
+#    cost on every call.
+
+_GOAL_KINDS = ("goal", "vision", "strategy", "target", "constraint", "non_goal", "success")
+_GOAL_KIND_ALIASES = {
+    "objective": "goal",
+    "objectives": "goal",
+    "goals": "goal",
+    "targets": "target",
+    "success": "success",
+    "success criteria": "success",
+    "acceptance criteria": "success",
+    "definition of done": "success",
+    "constraints": "constraint",
+    "constraint": "constraint",
+    "requirements": "constraint",
+    "requirement": "constraint",
+    "non-goal": "non_goal",
+    "non-goals": "non_goal",
+    "non goal": "non_goal",
+    "non goals": "non_goal",
+    "vision": "vision",
+    "strategy": "strategy",
+    "target": "target",
+    "goal": "goal",
+}
+_GOAL_KIND_ORDER = ("goal", "constraint", "success", "target", "strategy", "vision", "non_goal")
+_GOAL_KIND_LABEL = {
+    "goal": "Goal",
+    "constraint": "Constraints",
+    "success": "Success criteria",
+    "target": "Targets",
+    "strategy": "Strategy",
+    "vision": "Vision",
+    "non_goal": "Non-goals",
+}
+
+_GOAL_LINE_RE = re.compile(
+    r"^[ \t]*(?:[-*+•]|\d+[.)])?[ \t]*(?:\*\*|__)?"
+    r"(goal|goals|objective|objectives|vision|strategy|target|targets|"
+    r"success criteria|success|acceptance criteria|definition of done|"
+    r"constraints?|requirements?|non[- ]?goals?)"
+    r"(?:\*\*|__)?[ \t]*(?::|#|[-–—])[ \t]*(.*)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_GOAL_SEGMENT_RE = re.compile(
+    r"(?i)\s+(?=(?:goal|goals|objective|objectives|vision|strategy|target|targets|"
+    r"success criteria|success|acceptance criteria|definition of done|"
+    r"constraints?|requirements?|non[- ]?goals?)\s*(?::|#|[-–—])\s+)"
+)
+_GOAL_INLINE_RE = re.compile(
+    r"(?i)\b(?:the\s+|our\s+|my\s+)?"
+    r"(goal|objective|vision|strategy|target|success criteria|acceptance criteria|definition of done)"
+    r"(?:\s+(?:is|are|was|were)|:)\s+(.{3,500}?)(?=(?:[.!?](?:\s|$))|$)"
+)
+_GOAL_CONSTRAINT_RE = re.compile(
+    r"(?i)\b(?:must\s+not|must\s+never|never|do\s+not|don't|should\s+not|shouldn't|"
+    r"without|only|keep|preserve|avoid|no\s+more\s+than|at\s+most|at\s+least|"
+    r"required\s+to|ensure|make\s+sure)\b"
+)
+_GOAL_REVISION_RE = re.compile(
+    r"(?i)\b(?:instead|rather\s+than|change\s+of\s+plan|new\s+(?:goal|objective|vision|"
+    r"strategy|target|plan|direction|priority)|actually|scratch\s+that|no\s+longer|"
+    r"from\s+now\s+on|revise[ds]?|supersed\w*|replace\s+(?:the|our|that)|"
+    r"switch(?:ing)?\s+to|not\s+.{0,80}?\s+anymore|now\s+we\s+(?:want|need)|"
+    r"the\s+new\s+(?:goal|target|priority))\b"
+)
+_GOAL_REPLACE_RE = re.compile(
+    r"(?i)\b(?:instead|rather\s+than|no\s+longer|not\s+.{0,80}?\s+anymore|"
+    r"replace|drop|remove|forget|scrap|abandon)\b"
+)
+_GOAL_COMPLETION_RE = re.compile(
+    r"(?i)\b(?:goal|objective|task|project|mission)\s+(?:is\s+)?"
+    r"(?:complete|completed|done|finished)\b|"
+    r"\bmark\s+(?:the\s+)?(?:goal|task|objective)\s+(?:as\s+)?"
+    r"(?:complete|completed|done)\b"
+)
+
+
+def _goals_enabled() -> bool:
+    return _env_bool("APPEND_COMPACT_GOALS", False)
+
+
+def _goal_extraction_enabled() -> bool:
+    return _env_bool("APPEND_COMPACT_GOALS_EXTRACT", True)
+
+
+def _goal_level_enabled(level: str) -> bool:
+    if not _goals_enabled():
+        return False
+    return _env_bool(f"APPEND_COMPACT_GOALS_{level.upper()}", True)
+
+
+def _goal_placement() -> str:
+    value = os.environ.get("APPEND_COMPACT_GOALS_PLACEMENT", "beginning").strip().lower()
+    if value in {"per_level", "per-level", "per_chunk", "per-chunk", "chunk", "chunks"}:
+        return "per_level"
+    if value in {"beginning", "start", "prefix", "head", "front"}:
+        return "beginning"
+    if value in {"after_head", "after-head", "afterhead"}:
+        return "after_head"
+    if value in {"hybrid", "beginning+reminder", "prefix+reminder"}:
+        return "hybrid"
+    return "tail"
+
+
+def _goal_level_cap(level: str) -> int:
+    default = {
+        "L1": DEFAULT_GOAL_ANCHOR_L1_CHARS,
+        "L2": DEFAULT_GOAL_ANCHOR_L2_CHARS,
+        "L3": DEFAULT_GOAL_ANCHOR_L3_CHARS,
+    }.get(level, DEFAULT_GOAL_ANCHOR_L3_CHARS)
+    return max(80, _env_int(f"APPEND_COMPACT_GOALS_{level.upper()}_CHARS", default))
+
+
+def _goal_total_cap() -> int:
+    return max(120, _env_int("APPEND_COMPACT_GOALS_MAX_CHARS", DEFAULT_GOAL_ANCHOR_MAX_CHARS))
+
+
+def _goal_max_items() -> int:
+    return max(1, _env_int("APPEND_COMPACT_GOALS_MAX_ITEMS", DEFAULT_GOAL_MAX_ITEMS))
+
+
+def _goal_session_key(session: str | None) -> str:
+    return str(session) if session else "default"
+
+
+def _new_session_goal() -> dict[str, Any]:
+    return {
+        "version": 0,
+        "updated_at": None,
+        "next_id": 1,
+        "items": [],
+        "history": [],
+    }
+
+
+def _session_goal_store(
+    state: dict[str, Any],
+    session: str | None,
+    *,
+    create: bool = False,
+) -> dict[str, Any] | None:
+    goals = state.get("goals")
+    if not isinstance(goals, dict):
+        goals = new_goal_store()
+        state["goals"] = goals
+    sessions = goals.get("sessions")
+    if not isinstance(sessions, dict):
+        sessions = {}
+        goals["sessions"] = sessions
+    key = _goal_session_key(session)
+    store = sessions.get(key)
+    if isinstance(store, dict):
+        return store
+    if not create:
+        return None
+    store = _new_session_goal()
+    sessions[key] = store
+    return store
+
+
+def _clean_goal_text(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = unicodedata.normalize("NFKC", value)
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"^(?:[-*+•]|\d+[.)])\s+", "", text).strip()
+    return text[:600].rstrip()
+
+
+def _goal_norm(value: str) -> str:
+    text = re.sub(r"[^\w\s]+", " ", value.lower(), flags=re.UNICODE)
+    return " ".join(text.split())[:300]
+
+
+def _strip_goal_role(text: str) -> str:
+    return re.sub(r"^(?:User|Human|Assistant|Tool)\s*:\s*", "", text.strip(), count=1, flags=re.I)
+
+
+def _goal_kind(value: str) -> str:
+    return _GOAL_KIND_ALIASES.get(" ".join(value.lower().split()).replace("_", "-"), "goal")
+
+
+def _extract_goal_items(text: str) -> list[dict[str, Any]]:
+    """Deterministic, verbatim extraction from one user-authored turn.
+
+    It recognises explicit ``Goal:``/``Constraint:``-style lines, bullet lists
+    under an empty marker line, inline "our goal is ..." sentences and hard
+    constraint sentences.  It deliberately does not call a model: extraction
+    must be cheap, deterministic and available inside a hook.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return []
+    clean = _strip_goal_role(text)
+    items: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(
+        kind: str,
+        value: str,
+        confidence: float,
+        *,
+        explicit: bool = False,
+    ) -> None:
+        cleaned = _clean_goal_text(value)
+        if len(cleaned) < 4 or cleaned.lower() in {"none", "n/a", "na", "tbd", "todo"}:
+            return
+        norm = _goal_norm(cleaned)
+        if not norm:
+            return
+        key = (kind, norm)
+        if key in seen:
+            return
+        seen.add(key)
+        items.append({
+            "kind": kind,
+            "text": cleaned,
+            "norm": norm,
+            "confidence": round(float(confidence), 2),
+            "explicit": explicit,
+        })
+
+    def add_segmented(kind: str, value: str) -> None:
+        """Split ``Goal: A. Constraints: B`` on a second inline marker."""
+        parts = _GOAL_SEGMENT_RE.split(value)
+        add(kind, parts[0], 0.95, explicit=True)
+        for part in parts[1:]:
+            marker = _GOAL_LINE_RE.match(part.strip())
+            if marker:
+                add(_goal_kind(marker.group(1)), marker.group(2), 0.95, explicit=True)
+            else:
+                add(kind, part, 0.9)
+
+    current_kind: str | None = None
+    in_fence = False
+    for raw_line in clean.splitlines():
+        raw = raw_line.rstrip()
+        stripped = raw.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            current_kind = None
+            continue
+        if in_fence:
+            continue
+        if not stripped:
+            current_kind = None
+            continue
+        if stripped.lower() in {"user:", "human:", "assistant:", "tool:"}:
+            continue
+        # Markdown headings other than a recognised marker end a section.
+        had_heading = bool(re.match(r"^#{1,6}\s+", stripped))
+        line = re.sub(r"^#{1,6}\s+", "", stripped).strip()
+        marker = _GOAL_LINE_RE.match(line)
+        if marker:
+            kind = _goal_kind(marker.group(1))
+            value = marker.group(2).strip()
+            if value:
+                add_segmented(kind, value)
+                current_kind = None
+            else:
+                current_kind = kind
+            continue
+        if current_kind is not None:
+            if had_heading or re.match(r"^[A-Za-z][\w /-]{0,48}:\s*$", line):
+                current_kind = None
+                continue
+            add(current_kind, line, 0.9, explicit=True)
+            continue
+
+    # Inline goal and constraint sentences.  Fenced code is excluded above;
+    # remove it here so a code comment cannot become a goal.
+    prose = re.sub(r"(?ms)^```.*?^```", " ", clean)
+    prose = _strip_goal_role(prose)
+    for sentence in _split_sentences(prose):
+        if sentence.endswith("?"):
+            continue
+        # Explicit marker lines were parsed above; do not re-add the whole
+        # sentence as a second, differently-normalised goal.
+        if _GOAL_LINE_RE.match(sentence.strip()):
+            continue
+        for match in _GOAL_INLINE_RE.finditer(sentence):
+            value = match.group(2)
+            if _goal_norm(value) in {"complete", "completed", "done", "finished"}:
+                continue
+            add(_goal_kind(match.group(1)), value, 0.8)
+        if _GOAL_CONSTRAINT_RE.search(sentence):
+            add("constraint", sentence, 0.7)
+        if len(items) >= GOAL_ITEM_LIMIT:
+            break
+    return items[:GOAL_ITEM_LIMIT]
+
+
+def _sanitize_goal_store(raw: Any) -> dict[str, Any]:
+    store = new_goal_store()
+    if not isinstance(raw, dict):
+        return store
+    sessions = raw.get("sessions")
+    if not isinstance(sessions, dict):
+        return store
+    for session_key, raw_session in sessions.items():
+        if not isinstance(raw_session, dict):
+            continue
+        raw_items = raw_session.get("items")
+        if not isinstance(raw_items, list):
+            continue
+        items: list[dict[str, Any]] = []
+        max_version = 0
+        for raw_item in raw_items:
+            if not isinstance(raw_item, dict):
+                continue
+            text = _clean_goal_text(raw_item.get("text"))
+            if not text:
+                continue
+            kind = str(raw_item.get("kind") or "goal").lower()
+            if kind not in _GOAL_KINDS:
+                kind = "goal"
+            status = str(raw_item.get("status") or "active").lower()
+            if status not in {"active", "superseded", "completed"}:
+                status = "active"
+            version = int(raw_item.get("updated_version") or raw_item.get("created_version") or 0)
+            max_version = max(max_version, version)
+            source_chunks = []
+            for value in raw_item.get("source_chunks") or []:
+                if isinstance(value, int) and value > 0 and value not in source_chunks:
+                    source_chunks.append(value)
+            items.append({
+                "id": str(raw_item.get("id") or f"g{len(items) + 1}"),
+                "kind": kind,
+                "text": text,
+                "norm": _goal_norm(text),
+                "status": status,
+                "confidence": float(raw_item.get("confidence") or 0.5),
+                "source_chunks": source_chunks[-GOAL_SOURCE_LIMIT:],
+                "created_version": int(raw_item.get("created_version") or version),
+                "updated_version": version,
+                "created": str(raw_item.get("created") or ""),
+                "last_seen": str(raw_item.get("last_seen") or ""),
+                "superseded_by": raw_item.get("superseded_by"),
+            })
+        if not items:
+            continue
+        history = raw_session.get("history")
+        if not isinstance(history, list):
+            history = []
+        store["sessions"][str(session_key)] = {
+            "version": max(max_version, int(raw_session.get("version") or 0)),
+            "updated_at": raw_session.get("updated_at"),
+            "next_id": max(
+                int(raw_session.get("next_id") or 1),
+                len(items) + 1,
+            ),
+            "items": items[-GOAL_ITEM_LIMIT:],
+            "history": [entry for entry in history if isinstance(entry, dict)][-GOAL_HISTORY_LIMIT:],
+        }
+    return store
+
+
+def _cap_goal_store(store: dict[str, Any]) -> None:
+    items = store.get("items")
+    if not isinstance(items, list) or len(items) <= GOAL_ITEM_LIMIT:
+        return
+    active = [item for item in items if item.get("status") == "active"]
+    inactive = [item for item in items if item.get("status") != "active"]
+    # Active items always survive; only old superseded/completed records are
+    # pruned once the per-session bound is reached.
+    room = max(0, GOAL_ITEM_LIMIT - len(active))
+    store["items"] = active + inactive[-room:] if room else active
+    history = store.get("history")
+    if isinstance(history, list):
+        store["history"] = history[-GOAL_HISTORY_LIMIT:]
+
+
+def _active_goal_items(store: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not store:
+        return []
+    items = [
+        item for item in store.get("items", [])
+        if isinstance(item, dict) and item.get("status") == "active" and item.get("text")
+    ]
+    items.sort(key=lambda item: (
+        _GOAL_KIND_ORDER.index(item.get("kind")) if item.get("kind") in _GOAL_KIND_ORDER else 99,
+        int(item.get("created_version") or 0),
+        str(item.get("id") or ""),
+    ))
+    return items
+
+
+def _update_goals_from_text(
+    state: dict[str, Any],
+    text: str,
+    session: str | None,
+    source_chunk: int | None = None,
+) -> dict[str, Any] | None:
+    """Extract goal items from a user turn and apply deliberate revisions.
+
+    Returns the appended history entry when the session version changed, else
+    ``None``.  A repeated verbatim goal only refreshes provenance; it does not
+    create a new version or a second item.
+    """
+    if not _goals_enabled() or not _goal_extraction_enabled():
+        return None
+    items = _extract_goal_items(text)
+    completed = bool(_GOAL_COMPLETION_RE.search(text))
+    if not items and not completed:
+        return None
+    store = _session_goal_store(state, session, create=True)
+    if store is None:
+        return None
+
+    revision = bool(_GOAL_REVISION_RE.search(text))
+    replacement = bool(_GOAL_REPLACE_RE.search(text))
+    active = _active_goal_items(store)
+    preexisting = {id(item) for item in active}
+    existing = {(item["kind"], item["norm"]): item for item in active}
+    now = _now()
+    added: list[str] = []
+    superseded: list[str] = []
+    finished: list[str] = []
+    changed = False
+    version = int(store.get("version") or 0)
+
+    if completed:
+        for item in active:
+            item["status"] = "completed"
+            item["updated_version"] = version + 1
+            item["last_seen"] = now
+            finished.append(str(item.get("id")))
+        if finished:
+            changed = True
+
+    for candidate in items:
+        kind = candidate["kind"]
+        norm = candidate["norm"]
+        prior = existing.get((kind, norm))
+        if prior is not None and prior.get("status") == "active":
+            prior["last_seen"] = now
+            if source_chunk is not None and source_chunk not in prior.setdefault("source_chunks", []):
+                prior["source_chunks"] = (prior.get("source_chunks") or [])[-GOAL_SOURCE_LIMIT + 1:] + [source_chunk]
+            continue
+        new_id = f"g{int(store.get('next_id') or 1)}"
+        store["next_id"] = int(store.get("next_id") or 1) + 1
+        # An explicit ``Goal:``/``Vision:``/... line in a later user turn is a
+        # deliberate statement of the current mission, so it replaces the
+        # earlier active item of that kind even without the word "instead".
+        # Items added in this same turn are not touched: two explicit goal
+        # lines in one prompt remain two parallel goals.
+        mission_kind = kind in {"goal", "vision", "strategy", "target"}
+        replace_this_kind = (
+            (revision or bool(candidate.get("explicit"))) and mission_kind
+        ) or (revision and replacement)
+        if replace_this_kind:
+            for old in active:
+                if (
+                    id(old) in preexisting
+                    and old.get("kind") == kind
+                    and old.get("norm") != norm
+                    and old.get("status") == "active"
+                ):
+                    old["status"] = "superseded"
+                    old["superseded_by"] = new_id
+                    old["updated_version"] = version + 1
+                    old["last_seen"] = now
+                    superseded.append(str(old.get("id")))
+        new_item = {
+            "id": new_id,
+            "kind": kind,
+            "text": candidate["text"],
+            "norm": norm,
+            "status": "active",
+            "confidence": candidate["confidence"],
+            "source_chunks": [source_chunk] if source_chunk is not None else [],
+            "created_version": version + 1,
+            "updated_version": version + 1,
+            "created": now,
+            "last_seen": now,
+            "superseded_by": None,
+        }
+        store.setdefault("items", []).append(new_item)
+        active.append(new_item)
+        existing[(kind, norm)] = new_item
+        added.append(new_id)
+        changed = True
+
+    if not changed:
+        return None
+    version += 1
+    store["version"] = version
+    store["updated_at"] = now
+    entry = {
+        "version": version,
+        "at": now,
+        "source_chunk": source_chunk,
+        "event": "complete" if completed and not added else ("revise" if (superseded or replacement) else "extract"),
+        "added": added,
+        "superseded": superseded,
+        "completed": finished,
+    }
+    history = store.setdefault("history", [])
+    history.append(entry)
+    store["history"] = history[-GOAL_HISTORY_LIMIT:]
+    _cap_goal_store(store)
+    return entry
+
+
+def _record_goals_for_turn(
+    state: dict[str, Any],
+    text: str,
+    session: str | None,
+    source_chunk: int | None,
+    role: str | None,
+) -> dict[str, Any] | None:
+    """Only user-authored turns may establish or revise a goal."""
+    if role not in (None, "user"):
+        return None
+    return _update_goals_from_text(state, text, session, source_chunk)
+
+
+def _truncate_goal_text(text: str, budget: int) -> str:
+    if budget <= 0:
+        return ""
+    if len(text) <= budget:
+        return text
+    head = text[: max(1, budget - 1)]
+    cut = head.rfind(" ")
+    if cut > max(8, budget // 2):
+        head = head[:cut]
+    return head.rstrip(" ,;:-") + "…"
+
+
+def _goal_anchor_body(store: dict[str, Any], cap: int, header: str) -> str:
+    active = _active_goal_items(store)[:_goal_max_items()]
+    if not active or cap < 80:
+        return ""
+    lines = [header]
+    used = len(header) + 1
+    has_item = False
+    note = "Use as the current mission; older summaries may be stale."
+    if used + len(note) + 1 <= cap - 40:
+        lines.append(note)
+        used += len(note) + 1
+
+    def append_line(line: str) -> bool:
+        nonlocal used
+        if used + len(line) + 1 > cap:
+            return False
+        lines.append(line)
+        used += len(line) + 1
+        return True
+
+    for kind in _GOAL_KIND_ORDER:
+        group = [item for item in active if item.get("kind") == kind]
+        if not group:
+            continue
+        label = _GOAL_KIND_LABEL.get(kind, kind.title())
+        if len(group) == 1:
+            text = str(group[0]["text"])
+            line = f'{label} (verbatim): "{text}"'
+            if append_line(line):
+                has_item = True
+                continue
+            remaining = cap - used - 1
+            prefix = f'{label} (verbatim): "'
+            if remaining > len(prefix) + 12:
+                clipped = _truncate_goal_text(text, remaining - len(prefix) - 2)
+                has_item = append_line(prefix + clipped + '"') or has_item
+            # If the highest-priority group cannot fit, lower-priority groups
+            # will not fit either; stop rather than emit a misleading fragment.
+            break
+        header_line = f"{label} (verbatim):"
+        if not append_line(header_line):
+            break
+        for item in group:
+            bullet = f'- "{item["text"]}"'
+            if append_line(bullet):
+                has_item = True
+                continue
+            remaining = cap - used - 1
+            if remaining > 18:
+                clipped = _truncate_goal_text(str(item["text"]), remaining - 4)
+                has_item = append_line(f'- "{clipped}"') or has_item
+            else:
+                has_item = append_line("- …") or has_item
+            break
+    return "\n".join(lines) if has_item else ""
+
+
+def _render_goal_anchor(
+    store: dict[str, Any],
+    levels: list[str],
+    cap: int,
+    origin: str = "tail",
+) -> str:
+    version = int(store.get("version") or 0)
+    if origin == "shared":
+        header = f"[GOAL ANCHOR v{version} | shared]"
+    elif origin == "tail":
+        header = f"[GOAL ANCHOR v{version} | levels={','.join(levels)}]"
+    else:
+        header = f"[GOAL ANCHOR v{version} | level={levels[0]}]"
+    return _goal_anchor_body(store, max(80, cap), header)
+
+
+def _render_goal_reminder(store: dict[str, Any], cap: int | None = None) -> str:
+    """One-line recency reminder for the hybrid placement.
+
+    The beginning anchor is the durable copy.  This reminder exists only to
+    counter recency loss when the drift detector says the current prompt is
+    unrelated to the recent thread; it never replaces the stable anchor.
+    """
+    active = _active_goal_items(store)
+    if not active:
+        return ""
+    cap = max(60, cap if cap is not None else DEFAULT_GOAL_REMINDER_CHARS)
+    priority = [
+        item for kind in ("goal", "vision", "strategy", "target")
+        for item in active if item.get("kind") == kind
+    ]
+    goal = (priority or active)[0]
+    version = int(store.get("version") or 0)
+    header = f"[GOAL REMINDER v{version}]"
+    label = _GOAL_KIND_LABEL.get(str(goal.get("kind")), "Goal")
+    prefix = f'{label} (verbatim): "'
+    suffix = '"'
+    room = cap - len(header) - 1 - len(prefix) - len(suffix)
+    if room < 12:
+        return header
+    text = _truncate_goal_text(str(goal.get("text")), room)
+    return f"{header}\n{prefix}{text}{suffix}"
+
+
+def _dedupe_goal_sections(sections: list[tuple[str, str]], version: int) -> list[tuple[str, str]]:
+    """Drop duplicate bodies, keeping the earliest (highest-priority) copy.
+
+    Per-level anchors differ only in their header; repeating the same body at
+    two offsets costs bytes and adds no information, so one copy is enough.
+    The kept header still names its level, which is what placement needs.
+    """
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for level, text in sections:
+        body = "\n".join(text.splitlines()[1:])
+        if body and body in seen:
+            continue
+        out.append((level, text))
+        if body:
+            seen.add(body)
+    return out
+
+
+def _render_goal_anchors(
+    state: dict[str, Any],
+    session: str | None,
+    present: dict[str, bool],
+    *,
+    max_total: int | None = None,
+    drift: bool = False,
+) -> list[tuple[str, str]]:
+    """Render anchors for one injection; returns ``[(level, text), ...]``."""
+    if not _goals_enabled():
+        return []
+    store = _session_goal_store(state, session, create=False)
+    if not _active_goal_items(store):
+        return []
+    levels = [
+        level for level in ("L1", "L2", "L3")
+        if present.get(level) and _goal_level_enabled(level)
+    ]
+    if not levels:
+        return []
+    total_cap = max_total if max_total is not None else _goal_total_cap()
+    total_cap = max(80, total_cap)
+    placement = _goal_placement()
+    if placement == "hybrid":
+        hybrid_cap = max(
+            80,
+            _env_int(
+                "APPEND_COMPACT_GOALS_HYBRID_CHARS",
+                DEFAULT_GOAL_ANCHOR_HYBRID_CHARS,
+            ),
+        )
+        cap = min(total_cap, hybrid_cap)
+        text = _render_goal_anchor(store, levels, cap, "tail")
+        sections = [("+".join(levels), text)] if text else []
+        if drift and sections:
+            remaining = total_cap - len(text) - 2
+            if remaining >= 60:
+                reminder = _render_goal_reminder(
+                    store, min(DEFAULT_GOAL_REMINDER_CHARS, remaining)
+                )
+                if reminder:
+                    sections.append(("reminder", reminder))
+        return sections
+    if placement in {"tail", "beginning", "after_head"}:
+        cap = total_cap if len(levels) > 1 else min(total_cap, _goal_level_cap(levels[0]))
+        text = _render_goal_anchor(store, levels, cap, "tail")
+        return [("+".join(levels), text)] if text else []
+
+    order = [level for level in ("L2", "L3", "L1") if level in levels]
+    caps = {level: min(total_cap, _goal_level_cap(level)) for level in order}
+    sections: list[tuple[str, str]] = []
+    for level in order:
+        text = _render_goal_anchor(store, [level], caps[level], "per_level")
+        if text:
+            sections.append((level, text))
+
+    def cost(entries: list[tuple[str, str]]) -> int:
+        return sum(len(text) for _, text in entries) + 2 * max(0, len(entries) - 1)
+
+    if cost(sections) > total_cap:
+        scale = total_cap / max(1, cost(sections))
+        scaled: list[tuple[str, str]] = []
+        for level, _ in sections:
+            cap = max(80, int(caps[level] * scale))
+            text = _render_goal_anchor(store, [level], cap, "per_level")
+            if text:
+                scaled.append((level, text))
+        sections = scaled
+    # If headers alone overflow a very small total, prefer the deepest level
+    # (L3 is the oldest, least recoverable material) and drop L1, then L2.
+    while cost(sections) > total_cap and len(sections) > 1:
+        drop = "L1" if any(level == "L1" for level, _ in sections) else "L2"
+        sections = [(level, text) for level, text in sections if level != drop]
+    return _dedupe_goal_sections(sections, int(store.get("version") or 0))
+
+
+def _render_shared_goal_anchor(
+    state: dict[str, Any],
+    session: str | None,
+    cap: int,
+) -> str:
+    if not _env_bool("APPEND_COMPACT_GOALS_SHARED", False) or session is None:
+        return ""
+    if not _goals_enabled():
+        return ""
+    store = _session_goal_store(state, session, create=False)
+    if not _active_goal_items(store):
+        return ""
+    return _render_goal_anchor(store, ["shared"], min(cap, _goal_total_cap()), "shared")
+
+
+def _goal_metadata(
+    state: dict[str, Any],
+    session: str | None,
+    sections: list[tuple[str, str]],
+) -> dict[str, Any]:
+    store = _session_goal_store(state, session, create=False)
+    active = _active_goal_items(store)
+    return {
+        "enabled": _goals_enabled(),
+        "placement": _goal_placement(),
+        "version": int((store or {}).get("version") or 0),
+        "active": len(active),
+        "levels": [level for level, _ in sections],
+        "anchor_count": len(sections),
+        "anchor_chars": sum(len(text) for _, text in sections),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Handoff extraction (deterministic, additive)
+# ---------------------------------------------------------------------------
+# A benchmark on branch experiment/handoff-template-bench measured a
+# five-section handoff template against the current injection.  Two results
+# shape what is implemented here:
+#
+#   1. It has to be *additive*.  Replacing the ledger with a template loses
+#      what the template never wrote; adding sections to the ledger does not.
+#   2. The sections that earn their tokens are copying tasks -- a path, an
+#      exact value, an error line, a user's pending ask -- not summarising
+#      ones.  So they are built with regexes from the captured turns: no
+#      generator call, no latency on the hook path, and nothing invented.
+#
+# Generated handoffs recalled more per token, but generation belongs on the
+# background path and is deliberately not wired in here.  This is the fallback
+# that always works, and it is what ships.
+DEFAULT_HANDOFF_CHARS = 720
+DEFAULT_HANDOFF_PER_SECTION = 3
+DEFAULT_HANDOFF_RECENT_CHUNKS = 8
+DEFAULT_JOURNAL_MAX_OPEN = 4
+
+HANDOFF_HEADINGS = {
+    "open_questions_pending_asks": "Open questions / pending asks",
+    "errors_and_fixes": "Errors and fixes",
+    "files_symbols_references": "Files, symbols, exact references",
+    "critical_exact_values": "Critical exact values",
+}
+# Open asks render first: a resumed agent needs the unfinished instruction
+# before it needs the facts that surround it.
+HANDOFF_SECTION_ORDER = (
+    "open_questions_pending_asks",
+    "errors_and_fixes",
+    "files_symbols_references",
+    "critical_exact_values",
+)
+# Extraction caps: how many candidates survive ranking before rendering.
+HANDOFF_SECTION_CAPS = {
+    "open_questions_pending_asks": 8,
+    "errors_and_fixes": 6,
+    "files_symbols_references": 12,
+    "critical_exact_values": 8,
+}
+# Render caps: how many of them are worth showing every turn.  One section
+# must not starve the others, and the total character budget is the real
+# bound -- these are only a per-section share of it.
+HANDOFF_RENDER_CAPS = {
+    "open_questions_pending_asks": 3,
+    "errors_and_fixes": 3,
+    "files_symbols_references": 4,
+    "critical_exact_values": 4,
+}
+
+_HANDOFF_ERROR_RE = re.compile(
+    r"(?:Traceback|panic:|npm ERR!|error TS\d+|SyntaxError|TypeError|ValueError|"
+    r"OSError|Errno|too many open files|error:|fatal error|segmentation fault|"
+    r"^\s*(?:Fix|Fixed|Resolution)\s*:|"
+    # Raised codes: SQLITE_ERROR:, AUDIT_GAP_409:. Case-sensitive on purpose,
+    # so "file_name:" in prose does not read as an error.
+    r"(?-i:^\s*(?:Hit\s+)?[A-Z][A-Z0-9]*_[A-Z0-9_]+\s*:))",
+    re.I,
+)
+# A command the next turn will want to rerun carries no file extension, so no
+# other rule sees it.
+_HANDOFF_FLAG_RE = re.compile(r"(?:^|\s)--[a-z][\w-]*\b")
+# Longest extension first, plus a token boundary after it: without the
+# boundary "web/routes/checkout.tsx" matches as "checkout.ts".
+_HANDOFF_PATH_RE = re.compile(
+    r"(?:[\w.-]+/)*[\w.-]+\.(?:tsx|ts|jsx|js|json|toml|ya?ml|py|md|go|rs|java|lua|sql|sh|css|html)"
+    r"(?![\w])(?::\d+)?"
+)
+# Call-shaped symbols only, both spellings: real code is as often
+# preloadCheckoutChunk() as stream_export(), and snake_case alone silently
+# drops every camelCase symbol.
+_HANDOFF_CALL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]{2,})\s*\(")
+_HANDOFF_CALL_STOP = frozenset(
+    {"if", "for", "while", "switch", "catch", "return", "print", "and", "or", "not",
+     # "Traceback (most recent call last):" reads as a call and names nothing.
+     "traceback"}
+)
+_HANDOFF_LINE_RE = re.compile(r"\bline\s+\d+\b", re.I)
+# Strong numbers carry a unit, a version shape, or an explicit label.  A bare
+# integer is weak: transcripts are full of "Turn 12" and "17 warnings", and
+# ranking every integer equally buries the port number under noise.
+_HANDOFF_STRONG_NUM_RE = re.compile(
+    r"(?<![\w.])\d+(?:\.\d+)+|"
+    r"(?<![\w.])\d+(?:\.\d+)?\s?(?:ms|s|%|MB|GB|KB|rps|days?|hours?|minutes?|h|hrs?)\b|"
+    r"(?<![\w.])\d+(?:\.\d+)?\s?[kKMB]\b|"
+    r"(?:port|version|v)\s?\d+|"
+    r"(?<![\w.])\d+(?=\s*(?:shards|handles|retries|workers|seconds|lines))",
+    re.I,
+)
+# A trailing period must not hide a number: "--shards 8." is a fact, and
+# requiring a non-word character after the digit dropped it at clause end.
+_HANDOFF_WEAK_NUM_RE = re.compile(r"(?<![\w.])\d+(?:\.\d+)?(?!\w)")
+_HANDOFF_TURN_PREFIX_RE = re.compile(r"^\s*Turn\s+\d+\s*:\s*", re.I)
+_HANDOFF_CLAUSE_SPLIT_RE = re.compile(r"(?<=[.;!?])\s+")
+_HANDOFF_ASK_RE = re.compile(
+    r"\b(?:please|let's|lets|add|remove|rename|make sure|don't|do not|wait until|one more|"
+    r"need to|must|should|instead|avoid|ensure)\b",
+    re.I,
+)
+# Output of a command is not a fact: "pytest -q -> 214 passed, 3 skipped in
+# 8.4s" crowded the value slots in the benchmark and hurt delivery.  Drop the
+# clause rather than rank it.
+_HANDOFF_CHATTER_RE = re.compile(
+    r"(?:\b\d+\s+(?:passed|failed|skipped|errors?|warnings?)\b|"
+    r"\bcollected\s+\d+\b|"
+    r"\bcoverage\b|\bTOTAL\s+\d|"
+    r"(?:->|=>)\s*\d|"
+    r"\bin\s+\d+(?:\.\d+)?s\b|"
+    r"\bnpm (?:WARN|notice)\b)",
+    re.I,
+)
+
+# Journal tags.  The marker is ※ (U+203B) -- two tokens, no collisions in real
+# transcripts, and visible in a terminal.  The entry runs from the marker to
+# end of line; every punctuation candidate occurs inside the values we care
+# about ("2.7.1", "src/export/csv_writer.py", "Hit OSError: [Errno 24]").
+JOURNAL_MARKER = "※"
+JOURNAL_INSTRUCTION = (
+    "Journal: start a line with ※v, ※e or ※f for a fact, error or fix "
+    "(quote it word for word from the session), ※t <id> <task> to open a task, "
+    "※d <id> to close it."
+)
+_JOURNAL_LINE_RE = re.compile(r"(?m)^[ \t]*※([veftd])[ \t]?(.*)$")
+_JOURNAL_ID_RE = re.compile(r"^([A-Za-z0-9_.-]{1,32})(?:\s+(.*))?$")
+_JOURNAL_TURN_RE = re.compile(r"^(\d{1,5})\s+(.+)$")
+
+
+def _handoff_enabled() -> bool:
+    return _env_bool("APPEND_COMPACT_HANDOFF", True)
+
+
+def _journal_enabled() -> bool:
+    # Off by default: the benchmark priced only the emission/verification
+    # mechanism, and a usefulness audit of the task tags has not been run yet.
+    return _env_bool("APPEND_COMPACT_JOURNAL", False)
+
+
+def _handoff_cap() -> int:
+    return max(200, _env_int("APPEND_COMPACT_HANDOFF_CHARS", DEFAULT_HANDOFF_CHARS))
+
+
+def _handoff_per_section(key: str) -> int:
+    """Per-section item count, overridable for every section at once."""
+    override = _env_int("APPEND_COMPACT_HANDOFF_PER_SECTION", 0)
+    if override:
+        return max(1, override)
+    return HANDOFF_RENDER_CAPS.get(key, DEFAULT_HANDOFF_PER_SECTION)
+
+
+def _handoff_recent_chunks() -> int:
+    return max(1, _env_int("APPEND_COMPACT_HANDOFF_RECENT_CHUNKS", DEFAULT_HANDOFF_RECENT_CHUNKS))
+
+
+def _handoff_compact(text: str) -> str:
+    """Case- and punctuation-blind form, for dedupe only."""
+    return re.sub(r"[^a-z0-9]+", "", str(text).lower())
+
+
+def _handoff_tidy(item: str, limit: int = 160) -> str:
+    """Strip list markers and cut on a word boundary, never mid-word."""
+    text = re.sub(r"^[-*+]\s+", "", str(item).strip())
+    # "Turn 39: ..." is the transcript's own numbering, not part of the fact;
+    # keeping it both wastes a bullet and defeats duplicate detection.
+    text = _HANDOFF_TURN_PREFIX_RE.sub("", text, count=1)
+    # A clause split on ";" leaves the separator behind, which renders as a
+    # stray semicolon at the end of a bullet.
+    text = text.rstrip(";,").strip()
+    if len(text) > limit:
+        text = text[: limit - 3].rsplit(" ", 1)[0] + "..."
+    return text
+
+
+def _handoff_clauses(text: str) -> list[str]:
+    """Sentence-sized clauses, without a ``Turn N:`` prefix.
+
+    Clause granularity is the point: "8" alone could be a port, a count or a
+    timeout, but the sentence around it carries the meaning the resumed agent
+    needs.  The prefix is removed first or every entry looks like it mentions
+    a number.
+    """
+    text = _HANDOFF_TURN_PREFIX_RE.sub("", str(text), count=1)
+    clauses: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        for clause in _HANDOFF_CLAUSE_SPLIT_RE.split(stripped):
+            clause = clause.strip()
+            if clause:
+                clauses.append(clause)
+    return clauses
+
+
+def _handoff_rank(scored: list[tuple[float, int, int, str]], cap: int) -> list[str]:
+    """Strongest facts first, transcript order as the tie-break."""
+    scored = sorted(scored, key=lambda item: (-item[0], item[1], item[2]))
+    out: list[str] = []
+    for _score, _turn, _clause, text in scored:
+        if text not in out:
+            out.append(text)
+        if len(out) >= cap:
+            break
+    return out
+
+
+def _handoff_from_turn(text: str, turn: int, role: str | None = None) -> dict[str, list[list[Any]]]:
+    """Copy exact facts out of one raw turn; no model involved.
+
+    Returns ``{section: [[item, turn], ...]}`` with the section priority
+    errors, asks, files, values, so one clause is paid for once.  Nothing is
+    inferred: every item is a substring of the turn it is anchored to.
+    """
+    errors: list[tuple[float, int, int, str]] = []
+    values: list[tuple[float, int, int, str]] = []
+    asks: list[tuple[float, int, int, str]] = []
+    files: list[tuple[float, int, int, str]] = []
+    role_l = str(role or "").lower()
+    for c_index, clause in enumerate(_handoff_clauses(text)):
+        if _HANDOFF_CHATTER_RE.search(clause):
+            continue
+        is_error = bool(_HANDOFF_ERROR_RE.search(clause))
+        strong_hits = len(_HANDOFF_STRONG_NUM_RE.findall(clause))
+        weak = bool(_HANDOFF_WEAK_NUM_RE.search(clause))
+        tidy = _handoff_tidy(clause)
+        # Two signals separate a stated fact from a tool log: a user turn
+        # stated it, and the clause carries several exact values rather than
+        # one incidental count.
+        rank = 1.0 + (2.0 if role_l == "user" else 0.0) + min(strong_hits, 3) * 0.5
+        if is_error:
+            errors.append((rank + 3.0, 0, c_index, tidy))
+        elif strong_hits or weak:
+            values.append((rank, 0, c_index, tidy))
+        # Only user turns carry asks; an assistant sentence that happens to
+        # say "should" is commentary, not a request to act on.
+        elif role_l == "user" and _HANDOFF_ASK_RE.search(clause):
+            asks.append((1.0, 0, c_index, tidy))
+        for path in _HANDOFF_PATH_RE.findall(clause):
+            files.append((2.0, 0, c_index, path))
+        for ident in _HANDOFF_CALL_RE.findall(clause):
+            if ident.lower() not in _HANDOFF_CALL_STOP:
+                files.append((2.0, 0, c_index, ident))
+        for line_ref in _HANDOFF_LINE_RE.findall(clause):
+            files.append((2.0, 0, c_index, line_ref))
+        if _HANDOFF_FLAG_RE.search(clause) and not is_error:
+            files.append((2.5, 0, c_index, tidy))
+    payload = {
+        "errors_and_fixes": (errors, HANDOFF_SECTION_CAPS["errors_and_fixes"]),
+        "open_questions_pending_asks": (asks, HANDOFF_SECTION_CAPS["open_questions_pending_asks"]),
+        "files_symbols_references": (files, HANDOFF_SECTION_CAPS["files_symbols_references"]),
+        "critical_exact_values": (values, HANDOFF_SECTION_CAPS["critical_exact_values"]),
+    }
+    out: dict[str, list[list[Any]]] = {}
+    placed: set[str] = set()
+    for key, (scored, cap) in payload.items():
+        items = [item for item in _handoff_rank(scored, cap) if item not in placed]
+        placed.update(items)
+        if items:
+            out[key] = [[item, turn] for item in items]
+    return out
+
+
+def _ground_text(text: str) -> str:
+    """Comparison form for the journal verifier: case, whitespace, edge
+    punctuation normalised.  Word overlap deliberately does not count."""
+    return re.sub(r"\s+", " ", str(text).casefold()).strip(" \t.,;:!?\"'`()[]{}")
+
+
+def _strip_journal_lines(text: str) -> str:
+    return _JOURNAL_LINE_RE.sub("", str(text))
+
+
+def _grounded(body: str, source: str | None) -> bool:
+    """True when ``body`` appears contiguously in ``source``.
+
+    This is the fact checker: a regex cannot tell a copied fact from a
+    plausible invention, but a contiguous match can.  Derived reasoning fails
+    by design, which is why the journal only carries copied facts and state.
+    """
+    body_norm = _ground_text(body)
+    if len(body_norm) < 3 or not source:
+        return False
+    return body_norm in _ground_text(_strip_journal_lines(source))
+
+
+def _turn_source_text(state: dict[str, Any], session: str | None, number: int) -> str | None:
+    """The raw text of turn ``number``, for grounding a source-anchored tag."""
+    for chunk in reversed(state.get("l1_chunks", [])):
+        if int(chunk.get("n", 0)) != number or not _belongs(chunk, session):
+            continue
+        raw = recall_raw(str(chunk.get("raw_id") or "")) if chunk.get("raw_id") else None
+        return raw or str(chunk.get("compressed_text") or "")
+    return None
+
+
+def _harvest_tags(
+    text: str,
+    turn: int,
+    state: dict[str, Any] | None = None,
+    session: str | None = None,
+) -> list[dict[str, Any]]:
+    """Parse ``※`` journal lines, keeping only what the session can verify.
+
+    Kinds: ``v`` value, ``e`` error, ``f`` fix carry an optional source turn
+    (``※v 12 port 8443``); ``t`` opens a task by id and ``d`` closes it.  An
+    ungrounded tag is dropped, never rendered.
+    """
+    tags: list[dict[str, Any]] = []
+    for match in _JOURNAL_LINE_RE.finditer(str(text)):
+        kind = match.group(1)
+        body = match.group(2).strip()
+        if not body:
+            continue
+        tag: dict[str, Any] = {"kind": kind, "turn": turn, "grounded": False}
+        if kind in {"t", "d"}:
+            ident = _JOURNAL_ID_RE.match(body)
+            if not ident:
+                continue
+            tag["id"] = ident.group(1)
+            tag["body"] = (ident.group(2) or "").strip()
+            # Task state is the model's own bookkeeping, not a copied fact;
+            # there is nothing in the transcript to ground it against.
+            tag["grounded"] = True
+            tags.append(tag)
+            continue
+        source_turn = turn
+        anchor = _JOURNAL_TURN_RE.match(body)
+        if anchor:
+            source_turn = int(anchor.group(1))
+            body = anchor.group(2).strip()
+        source = (
+            _turn_source_text(state, session, source_turn)
+            if state is not None and source_turn != turn
+            else str(text)
+        )
+        if not _grounded(body, source):
+            continue
+        tag["body"] = body
+        tag["source"] = source_turn
+        tag["grounded"] = True
+        tags.append(tag)
+    return tags
+
+
+def _journal_open_tasks(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Replay ``t``/``d`` tags in chunk order; return the still-open tasks.
+
+    Pure function of immutable chunks, so a reopened id is correct and nothing
+    has to be rewritten when a task closes.
+    """
+    order: list[str] = []
+    open_tasks: dict[str, dict[str, Any]] = {}
+    for chunk in chunks:
+        for tag in chunk.get("tags") or []:
+            if not isinstance(tag, dict):
+                continue
+            ident = tag.get("id")
+            if not ident:
+                continue
+            if tag.get("kind") == "t":
+                if ident not in open_tasks:
+                    order.append(ident)
+                open_tasks[ident] = {
+                    "id": ident,
+                    "text": str(tag.get("body") or ""),
+                    "turn": tag.get("turn"),
+                }
+            elif tag.get("kind") == "d":
+                open_tasks.pop(ident, None)
+    return [open_tasks[ident] for ident in order if ident in open_tasks]
+
+
+def _render_handoff(
+    state: dict[str, Any],
+    session: str | None,
+    ledger_text: str,
+    cap: int | None = None,
+    rest_text: str = "",
+) -> tuple[str, dict[str, Any]]:
+    """Render the additive handoff section, bounded to ``cap`` characters.
+
+    Items are gathered newest-first so the freshest statement of a fact wins,
+    deduped against the ledger (the ledger already pins paths and symbols) and
+    capped per section.  The journal, when enabled, contributes only task
+    state -- the one thing neither a template nor a copier can know.
+    """
+    cap = _handoff_cap() if cap is None else max(0, cap)
+    chunks = [chunk for chunk in state.get("l1_chunks", []) if _belongs(chunk, session)]
+    recent = chunks[-_handoff_recent_chunks():]
+    # A bullet is worth its tokens only if the rest of the injection does not
+    # already say it.  ``rest_text`` is the assembled view without this section
+    # (ledger, masters, index lines, live chunks), so this is what makes the
+    # handoff additive rather than a second copy of the transcript.
+    already_shown = _handoff_compact(ledger_text) + _handoff_compact(rest_text)
+    sections: dict[str, list[str]] = {key: [] for key in HANDOFF_SECTION_ORDER}
+    seen: set[str] = set()
+    for chunk in reversed(recent):
+        handoff = chunk.get("handoff")
+        if not isinstance(handoff, dict):
+            continue
+        for key in HANDOFF_SECTION_ORDER:
+            if len(sections[key]) >= _handoff_per_section(key):
+                continue
+            for entry in handoff.get(key) or []:
+                if not isinstance(entry, (list, tuple)) or not entry:
+                    continue
+                item = str(entry[0])
+                compact = _handoff_compact(item)
+                if not compact or compact in seen or compact in already_shown:
+                    continue
+                turn = entry[1] if len(entry) > 1 else "?"
+                sections[key].append(f"{item} (turn {turn})")
+                seen.add(compact)
+    open_tasks: list[dict[str, Any]] = []
+    if _journal_enabled():
+        for task in _journal_open_tasks(chunks)[-DEFAULT_JOURNAL_MAX_OPEN:]:
+            label = f"- [task {task['id']}] {task['text']}".rstrip()
+            compact = _handoff_compact(label)
+            if compact and compact not in seen:
+                sections["open_questions_pending_asks"].append(
+                    f"{label} (turn {task.get('turn')})"
+                )
+                open_tasks.append(task)
+    def compose() -> str:
+        lines: list[str] = []
+        if any(sections.values()):
+            lines.append("## Session handoff (key facts)")
+            for key in HANDOFF_SECTION_ORDER:
+                if not sections[key]:
+                    continue
+                lines.append("")
+                lines.append(f"### {HANDOFF_HEADINGS[key]}")
+                lines.extend(f"- {item}" for item in sections[key])
+        return "\n".join(lines)
+
+    text = compose()
+    # Trim items from the least load-bearing end first, so the section order
+    # keeps its priority under a tight budget; drop nothing silently.
+    while len(text) > cap and any(sections[key] for key in reversed(HANDOFF_SECTION_ORDER)):
+        for key in reversed(HANDOFF_SECTION_ORDER):
+            if sections[key]:
+                sections[key].pop()
+                break
+        text = compose()
+    if len(text) > cap or not text:
+        return "", {"enabled": _handoff_enabled(), "sections": 0, "items": 0, "chars": 0}
+    if _journal_enabled() and len(text) + len(JOURNAL_INSTRUCTION) + 1 <= cap:
+        text = text + "\n" + JOURNAL_INSTRUCTION
+    return text, {
+        "enabled": _handoff_enabled(),
+        "sections": sum(1 for key in HANDOFF_SECTION_ORDER if sections[key]),
+        "items": sum(len(items) for items in sections.values()),
+        "chars": len(text),
+        "open_tasks": len(open_tasks),
+    }
+
+
 
 CODE_EXTENSIONS = (
     "ts|tsx|mts|cts|js|jsx|mjs|cjs|py|pyi|pyw|go|rs|java|kt|kts|c|h|cc|cpp|cxx|hpp|hh|"
@@ -537,10 +2158,45 @@ def extract_symbols(text: str) -> set[str]:
     return symbols
 
 
+def _is_raw_archive_path(value: str) -> bool:
+    """True for internal ``~/.cache/append-compactor/raw/...`` pointers.
+
+    Skeleton placeholders name the raw file so an agent can read the block
+    back.  That path is plumbing, not a fact worth pinning: it is long, it is
+    unique per block, and left in the ledger it evicts real symbols from the
+    injection budget.
+    """
+    normalized = value.replace("\\", "/")
+    root = _raw_dir().as_posix()
+    home = Path.home().as_posix()
+    prefixes = {root}
+    if root.startswith(home + "/"):
+        prefixes.add("~" + root[len(home):])
+    return any(normalized == prefix or normalized.startswith(prefix + "/") for prefix in prefixes)
+
+
 def extract_entities(text: str) -> list[str]:
-    """Deterministic ledger entries: paths first, then symbols, each sorted."""
-    entries = [f"path: {p}" for p in sorted(extract_paths(text))]
-    entries.extend(f"symbol: {s}" for s in sorted(extract_symbols(text)))
+    """Deterministic ledger entries: paths, symbols, then exact facts.
+
+    Fact entries are skipped when the same value is already pinned as a path or
+    symbol, so the ledger does not grow a duplicate line per capture.
+    """
+    paths = {
+        path for path in extract_paths(text)
+        if not _is_raw_archive_path(path) and not _is_l3_archive_path(path)
+    }
+    symbols = extract_symbols(text)
+    entries = [f"path: {p}" for p in sorted(paths)]
+    entries.extend(f"symbol: {s}" for s in sorted(symbols))
+    if _fact_ledger_enabled():
+        covered = paths | symbols
+        entries.extend(
+            f"fact: {value}"
+            for value in sorted(extract_facts(text))
+            if value not in covered
+            and not _is_raw_archive_path(value)
+            and not _is_l3_archive_path(value)
+        )
     return entries
 
 
@@ -611,7 +2267,154 @@ _NUMERIC_LITERAL_PATTERN = (
     r"|\b\d+(?:%|ns|µs|us|ms|s|KiB|MiB|GiB|TiB|KB|MB|GB|TB|PB)(?![\w])"
 )
 
-_MASKABLE_RE = re.compile(
+# ---------------------------------------------------------------------------
+# Exact-fact patterns
+#
+# These are the identifiers that compaction must never lose: a wrong path,
+# version or exit code is worse than a dropped adjective.  The same patterns
+# feed two mechanisms: masked literals are restored byte-exact after the model
+# runs, and extracted facts are pinned in the entity ledger so they survive L2
+# digest truncation and the injection budget.  Matching is deliberately
+# context-anchored; bare integers are left alone.
+# ---------------------------------------------------------------------------
+
+_FILELINE_PATTERN = (
+    r"(?<![\w/])(?:" + _FILE_PATH_PATTERN + r"):\d+(?::\d+)?"
+)
+_BARE_PATH_PATTERN = r"(?<![\w/])(?:[\w.@+-]+/){2,}[\w.@+-]+\b"
+_PKG_VERSION_PATTERN = (
+    r"\b(?:@[a-z0-9._-]+/)?[a-z0-9][a-z0-9._-]*@\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.]+)?"
+)
+_SEMVER_RANGE_PATTERN = (
+    r"(?:[<>]=?\s*)?\d+\.\d+\.\d+(?:\s+(?:[<>]=?\s*)\d+\.\d+\.\d+)+"
+)
+_SOFTWARE_VERSION_PATTERN = (
+    r"\b(?:PostgreSQL|Postgres|Node|node|Python|python3?|OpenSSL|openssl|Go|Rust|"
+    r"Java|React|CUDA|Ubuntu|Debian|Alpine|macOS|Windows|Chrome|Firefox|nginx|"
+    r"Redis|MySQL|SQLite|Ruby|PHP|Kotlin|Swift|Scala|Elixir|Erlang|Terraform|"
+    r"Docker|Kubernetes)\s+v?\d+(?:\.\d+)+"
+)
+_IP_PORT_PATTERN = r"\b\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?\b"
+_VERSION_PATTERN = r"\bv?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.]+)?\b"
+_SHORT_VERSION_PATTERN = r"\bv\d+(?:\.\d+)*\b"
+_PORT_PATTERN = r"\b(?i:port)\s+\d{1,5}\b|\blocalhost:\d{1,5}\b"
+_HTTP_STATUS_PATTERN = r"\b(?i:HTTP(?:/[0-9.]+)?\s+[1-5]\d{2})\b"
+_EXIT_CODE_PATTERN = (
+    r"\b(?i:exit(?:ed)?(?:\s+with)?(?:\s+code)?|status(?:\s+code)?)"
+    r"\s*[:=]?\s*[1-9]\d{0,2}\b"
+)
+_COMMAND_PATTERN = (
+    r"\b(?:cargo|npm|pnpm|yarn|npx|go|make|cmake|docker|podman|kubectl|helm|"
+    r"git|pytest|python3?|pip3?|uv|poetry|rustc|gcc|g\+\+|clang|mvn|gradle|bazel)"
+    r"\s+(?:build|test|run|check|install|ci|add|remove|publish|exec|fmt|clippy|"
+    r"bench|apply|get|describe|logs|create|delete|push|pull|commit|status|diff)\b"
+    r"(?:\s+--?[\w-]+(?:=\S+)?)*"
+)
+_CVE_PATTERN = r"\b(?i:CVE-\d{4}-\d{4,})\b"
+_HEADER_PATTERN = (
+    r"\b(?:X-[A-Za-z0-9-]{2,}|Content-(?:Type|Length|Encoding)|User-Agent|"
+    r"Authorization|Accept-Encoding|Accept-Language|Cache-Control|If-None-Match|ETag)\b"
+)
+_TIMESTAMP_PATTERN = (
+    r"\b20\d{2}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])"
+    r"T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b"
+)
+_DATE_PATTERN = r"\b20\d{2}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])\b"
+_SHA_PATTERN = (
+    r"\b(?i:(?=[0-9a-f]{7,40}\b)(?=[0-9a-f]*[a-f])(?=[0-9a-f]*\d)"
+    r"[0-9a-f]{7,40})\b"
+)
+_ENV_PATTERN = r"\b(?=[A-Z0-9_]{6,}\b)[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b"
+_SNAKE_PATTERN = r"\b(?=[a-z0-9_]{6,}\b)[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b"
+_CAMEL_PATTERN = (
+    r"(?<![\w$])(?=[\w$]{6,}(?![\w$]))"
+    r"(?:[a-z][a-z0-9]*(?:[A-Z][a-z0-9]*)+"
+    r"|[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*)+"
+    r"|(?:[A-Z]{2,}[a-z0-9]+)+[A-Za-z0-9]*)"
+    r"(?![\w$])"
+)
+_DURATION_PATTERN = r"\b\d+(?:\.\d+)?\s?(?:ns|µs|us|ms|min|s|h)\b"
+_FLAG_PATTERN = r"\b[a-z][a-z0-9]*(?:\.[a-z][a-z0-9_-]+){2,}\b"
+_ERRCODE_PATTERN = r"\bE[A-Z0-9]{3,}\b"
+
+_FACT_MASK_PATTERNS = (
+    _FILELINE_PATTERN,
+    _BARE_PATH_PATTERN,
+    _PKG_VERSION_PATTERN,
+    _SEMVER_RANGE_PATTERN,
+    _SOFTWARE_VERSION_PATTERN,
+    _IP_PORT_PATTERN,
+    _VERSION_PATTERN,
+    _SHORT_VERSION_PATTERN,
+    _PORT_PATTERN,
+    _HTTP_STATUS_PATTERN,
+    _EXIT_CODE_PATTERN,
+    _COMMAND_PATTERN,
+    _CVE_PATTERN,
+    _HEADER_PATTERN,
+    _TIMESTAMP_PATTERN,
+    _DATE_PATTERN,
+    _SHA_PATTERN,
+    _DURATION_PATTERN,
+)
+
+# (kind, pattern) in priority order.  A later pattern never re-matches a span
+# an earlier one claimed, so "v3.7.1" is one fact, not also "v3".
+_FACT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("url", re.compile(r"https?://[^\s<>\"')\]]+")),
+    ("fileline", re.compile(_FILELINE_PATTERN)),
+    ("path", re.compile(_BARE_PATH_PATTERN)),
+    ("pkg", re.compile(_PKG_VERSION_PATTERN)),
+    ("semver", re.compile(_SEMVER_RANGE_PATTERN)),
+    ("version", re.compile(_SOFTWARE_VERSION_PATTERN)),
+    ("ipport", re.compile(_IP_PORT_PATTERN)),
+    ("version", re.compile(_VERSION_PATTERN)),
+    ("version", re.compile(_SHORT_VERSION_PATTERN)),
+    ("port", re.compile(_PORT_PATTERN)),
+    ("http", re.compile(_HTTP_STATUS_PATTERN)),
+    ("exit", re.compile(_EXIT_CODE_PATTERN)),
+    ("command", re.compile(_COMMAND_PATTERN)),
+    ("cve", re.compile(_CVE_PATTERN)),
+    ("header", re.compile(_HEADER_PATTERN)),
+    ("date", re.compile(_TIMESTAMP_PATTERN)),
+    ("date", re.compile(_DATE_PATTERN)),
+    ("sha", re.compile(_SHA_PATTERN)),
+    ("duration", re.compile(_DURATION_PATTERN)),
+    ("env", re.compile(_ENV_PATTERN)),
+    ("setting", re.compile(_SNAKE_PATTERN)),
+    ("camel", re.compile(_CAMEL_PATTERN)),
+    ("flag", re.compile(_FLAG_PATTERN)),
+    ("errcode", re.compile(_ERRCODE_PATTERN)),
+)
+
+# Per-kind cap per captured turn.  A code-heavy turn can contain dozens of
+# snake_case identifiers; pinning all of them would crowd out paths and facts
+# in the 2k ledger.
+_FACT_CAP_PER_KIND = {
+    "url": 8,
+    "fileline": 8,
+    "path": 16,
+    "pkg": 8,
+    "semver": 4,
+    "version": 12,
+    "ipport": 8,
+    "port": 6,
+    "http": 8,
+    "exit": 6,
+    "command": 8,
+    "cve": 4,
+    "header": 8,
+    "date": 6,
+    "sha": 8,
+    "duration": 8,
+    "env": 16,
+    "setting": 16,
+    "camel": 12,
+    "flag": 8,
+    "errcode": 6,
+}
+
+_BASE_MASKABLE_RE = re.compile(
     r"`[^`\n]+`"
     r"|https?://[^\s<>\"')\]]+"
     r"|" + _FILE_PATH_PATTERN +
@@ -621,6 +2424,49 @@ _MASKABLE_RE = re.compile(
     r"|\b[a-z][a-z0-9]*[A-Z][A-Za-z0-9]*\b"
     r"|\b[A-Z][a-z0-9]*[A-Z][A-Za-z0-9]*\b"
 )
+
+# Fact patterns go before the generic file-path/numeric alternatives:
+# otherwise "src/app.ts:12" masks only "src/app.ts", and "10.0.4.17:8443"
+# masks "10.0.4.17" plus a separate numeric literal.
+_FACT_MASKABLE_RE = re.compile(
+    r"`[^`\n]+`"
+    r"|https?://[^\s<>\"')\]]+"
+    r"|" + "|".join(_FACT_MASK_PATTERNS) +
+    r"|" + _FILE_PATH_PATTERN +
+    r"|" + _NUMERIC_LITERAL_PATTERN +
+    r"|\b[A-Za-z_$][\w$]*(?:_[A-Za-z0-9_$]+)+\b"
+    r"|\b[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+\b"
+    r"|\b[a-z][a-z0-9]*[A-Z][A-Za-z0-9]*\b"
+    r"|\b[A-Z][a-z0-9]*[A-Z][A-Za-z0-9]*\b"
+)
+
+
+def _fact_ledger_enabled() -> bool:
+    return _env_bool("APPEND_COMPACT_FACT_LEDGER", True)
+
+
+def _active_maskable_re() -> re.Pattern[str]:
+    return _FACT_MASKABLE_RE if _fact_ledger_enabled() else _BASE_MASKABLE_RE
+
+
+def extract_facts(text: str) -> set[str]:
+    """Extract exact facts in priority order, skipping already-claimed spans."""
+    claimed: list[tuple[int, int]] = []
+    by_kind: dict[str, set[str]] = {}
+    for kind, pattern in _FACT_PATTERNS:
+        for match in pattern.finditer(text):
+            start, end = match.span()
+            if any(start < other_end and other_start < end for other_start, other_end in claimed):
+                continue
+            value = re.sub(r"\s+", " ", match.group(0)).strip()
+            if not value:
+                continue
+            claimed.append((start, end))
+            by_kind.setdefault(kind, set()).add(value)
+    facts: set[str] = set()
+    for kind, values in by_kind.items():
+        facts.update(sorted(values)[: _FACT_CAP_PER_KIND.get(kind, 12)])
+    return facts
 
 
 def _language(info: str) -> str:
@@ -898,6 +2744,191 @@ def _render_fence(info: str, body: str) -> str:
     return f"```{info}\n{body}\n```"
 
 
+# ---------------------------------------------------------------------------
+# Code skeletonization with raw-block placeholders
+#
+# A large fenced code block often exists to show structure: imports, classes,
+# signatures, constants.  Replacing bodies with ``...`` keeps that structure
+# at a fraction of the size.  It is off by default because bodies can hold the
+# fact you actually needed; the recall harness measures the trade-off.
+# ---------------------------------------------------------------------------
+
+CODE_SKELETON_MIN_CHARS = 2_000
+_BRACED_DECL_RE = re.compile(
+    r"\b(?:export\s+)?(?:default\s+)?(?:async\s+)?"
+    r"(?:function|class|interface|type|enum|struct|impl|trait|fn|func|constructor|"
+    r"namespace|module)\b"
+)
+_BRACED_METHOD_RE = re.compile(
+    r"^\s*(?:[\w$<>[\],.?]+\s+)*\w+\s*\([^;]*\)\s*(?::[^{]+)?\{\s*$"
+)
+_BRACED_CONTROL_RE = re.compile(
+    r"^\s*(?:if|for|while|switch|catch|with|else|try|do|return)\b"
+)
+
+
+def _code_skeleton_enabled() -> bool:
+    # Skeleton bodies are recoverable from the raw archive, so this can be on
+    # by default.  If raw archiving is disabled, _compress_fence falls back to
+    # minified code rather than dropping a body with no reference.
+    return _env_bool("APPEND_COMPACT_CODE_SKELETON", True)
+
+
+def _python_doc_first_line(node: ast.AST) -> str:
+    body = getattr(node, "body", None)
+    if not body:
+        return ""
+    first = body[0]
+    if (
+        isinstance(first, ast.Expr)
+        and isinstance(first.value, ast.Constant)
+        and isinstance(first.value.value, str)
+    ):
+        text = first.value.value.strip()
+        if text:
+            return text.splitlines()[0][:120]
+    return ""
+
+
+def skeleton_python_source(source: str) -> str | None:
+    """AST-based Python skeleton: imports, signatures, constants, first doc line."""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError, MemoryError):
+        return None
+    lines = source.splitlines()
+    out: list[str] = []
+
+    def header_end(node: ast.AST) -> int:
+        body = getattr(node, "body", None) or []
+        return body[0].lineno if body else getattr(node, "lineno", 1)
+
+    def emit(node: ast.AST, indent: int) -> None:
+        pad = " " * indent
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            out.extend(lines[node.lineno - 1: node.end_lineno])
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for dec in node.decorator_list:
+                out.extend(lines[dec.lineno - 1: dec.end_lineno])
+            body_line = header_end(node)
+            if body_line <= node.lineno:
+                out.extend(lines[node.lineno - 1: node.end_lineno])
+                return
+            out.extend(lines[node.lineno - 1: body_line - 1])
+            doc = _python_doc_first_line(node)
+            if doc:
+                out.append(pad + "    " + '"""' + doc.replace('"""', "'''") + '"""')
+            out.append(pad + "    ...")
+        elif isinstance(node, ast.ClassDef):
+            for dec in node.decorator_list:
+                out.extend(lines[dec.lineno - 1: dec.end_lineno])
+            body_line = header_end(node)
+            if body_line <= node.lineno:
+                out.extend(lines[node.lineno - 1: node.end_lineno])
+                return
+            out.extend(lines[node.lineno - 1: body_line - 1])
+            doc = _python_doc_first_line(node)
+            if doc:
+                out.append(pad + "    " + '"""' + doc.replace('"""', "'''") + '"""')
+            emitted = 0
+            for child in node.body:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    emit(child, child.col_offset)
+                    emitted += 1
+                elif isinstance(child, (ast.Assign, ast.AnnAssign)) and _simple_value(child.value):
+                    out.extend(lines[child.lineno - 1: child.end_lineno])
+                    emitted += 1
+            if not emitted and not doc:
+                out.append(pad + "    ...")
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)) and indent == 0:
+            out.extend(lines[node.lineno - 1: node.end_lineno])
+
+    for statement in tree.body:
+        emit(statement, 0)
+    skeleton = "\n".join(line for line in out if line.strip())
+    return skeleton or None
+
+
+def _simple_value(value: ast.AST) -> bool:
+    return isinstance(
+        value,
+        (ast.Constant, ast.List, ast.Tuple, ast.Dict, ast.Set, ast.UnaryOp, ast.BinOp),
+    )
+
+
+def skeleton_braced_source(source: str) -> str | None:
+    """Conservative signature skeleton for brace languages (JS/TS/Go/Rust/Java)."""
+    lines = source.splitlines()
+    out: list[str] = []
+    depth = 0
+    skipped = False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        is_method = (
+            bool(_BRACED_METHOD_RE.match(line))
+            and not _BRACED_CONTROL_RE.match(line)
+        )
+        keep = (
+            depth == 0
+            or bool(_BRACED_DECL_RE.search(stripped))
+            or is_method
+            or stripped in {"{", "}", "};", "})", "});"}
+        )
+        if keep:
+            out.append(line)
+            skipped = False
+        elif not skipped:
+            indent = line[: len(line) - len(line.lstrip())]
+            out.append(indent + "// ...")
+            skipped = True
+        depth = max(0, depth + line.count("{") - line.count("}"))
+    skeleton = "\n".join(out)
+    return skeleton or None
+
+
+_SKELETON_LANGS = {
+    "javascript", "js", "jsx", "typescript", "ts", "tsx", "go", "golang",
+    "rust", "rs", "java", "kotlin", "kt", "scala", "c", "cpp", "c++", "h",
+    "hpp", "cs", "csharp", "swift", "dart", "php",
+}
+
+
+def _skeletonize_fence(info: str, body: str, stats: dict[str, int]) -> str | None:
+    if not _code_skeleton_enabled() or len(body) < CODE_SKELETON_MIN_CHARS:
+        return None
+    lang = _language(info)
+    if lang in {"python", "py", "python3"}:
+        skeleton = skeleton_python_source(body)
+    elif lang in _SKELETON_LANGS:
+        skeleton = skeleton_braced_source(body)
+    else:
+        return None
+    if skeleton and len(skeleton.strip()) < len(body.strip()):
+        return skeleton.strip()
+    return None
+
+
+_SKELETON_RAW_ID_RE = re.compile(r"([0-9a-f]{64})\.txt; read before editing")
+
+
+def _skeleton_placeholder(lang: str, raw_id: str, body: str) -> str:
+    """One-line pointer to the full block in the raw archive.
+
+    The raw file is the exact fenced body (no fence lines), so an agent can
+    read it directly or pass the id to ``--recall``.  Skeletonization is only
+    used when this pointer can be written: losing a body without leaving a
+    recoverable reference is worse than keeping the minified code.
+    """
+    marker = "#" if lang in {"python", "py", "python3"} else "//"
+    count = max(1, len(body.splitlines()))
+    return (
+        f"{marker} [skeleton: {count} lines elided; "
+        f"full code: {_raw_file_display(raw_id)}; read before editing]"
+    )
+
+
 def _compress_fence(info: str, body: str, stats: dict[str, int]) -> str:
     lang = _language(info)
     if lang in {"json", "jsonc"}:
@@ -907,15 +2938,27 @@ def _compress_fence(info: str, body: str, stats: dict[str, int]) -> str:
             return _render_fence(info, compact)
         # Invalid JSON must be left byte-for-byte alone.
         return _render_fence(info, body.rstrip("\n"))
+    normal = body.rstrip("\n")
     if lang in {"python", "py", "python3"}:
         mini = minify_python_source(body)
         if mini is not None:
-            stats["code_blocks"] += 1
-            return _render_fence(info, mini)
-    stripped = strip_line_level(body, lang)
-    if stripped != body.rstrip("\n"):
+            normal = mini
+    else:
+        stripped = strip_line_level(body, lang)
+        if stripped != normal:
+            normal = stripped
+    if normal != body.rstrip("\n"):
         stats["code_blocks"] += 1
-    return _render_fence(info, stripped)
+    skeleton = _skeletonize_fence(info, body, stats)
+    if skeleton is not None and len(skeleton) < len(normal):
+        raw_id = archive_raw(body)
+        if raw_id is not None:
+            annotated = _skeleton_placeholder(lang, raw_id, body) + "\n" + skeleton
+            if len(annotated) < len(normal):
+                stats["code_skeleton_blocks"] = stats.get("code_skeleton_blocks", 0) + 1
+                stats.setdefault("code_block_ids", []).append(raw_id)
+                return _render_fence(info, annotated)
+    return _render_fence(info, normal)
 
 
 # ---------------------------------------------------------------------------
@@ -1268,7 +3311,7 @@ def _mask_entities(text: str) -> tuple[str, list[str], dict[str, str]]:
         mapping[placeholder] = original
         return placeholder
 
-    masked = _MASKABLE_RE.sub(replace, text)
+    masked = _active_maskable_re().sub(replace, text)
     return masked, list(mapping), mapping
 
 
@@ -1277,6 +3320,78 @@ def _restore_entities(masked: str, mapping: dict[str, str]) -> str:
     for placeholder, original in mapping.items():
         restored = restored.replace(placeholder, original)
     return restored
+
+
+_SENTENCE_BREAK_RE = re.compile(r"[.!?]+(?=\s+|$)")
+_ABBREVIATIONS = {
+    "e.g", "i.e", "etc", "vs", "dr", "mr", "ms", "mrs", "prof", "inc", "ltd",
+    "no", "fig", "approx", "cf", "al",
+}
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split prose at sentence ends, skipping common abbreviations and initials."""
+    parts: list[str] = []
+    start = 0
+    for match in _SENTENCE_BREAK_RE.finditer(text):
+        end = match.end()
+        if end >= len(text):
+            break
+        before = text[max(0, match.start() - 24): match.start()]
+        word = re.sub(r"^[^\w]+", "", before).rsplit(None, 1)[-1].lower() if before.strip() else ""
+        word = word.strip(".")
+        next_char = text[end:].lstrip()[:1]
+        if word in _ABBREVIATIONS or (len(word) == 1 and word.isalpha()):
+            continue
+        if re.fullmatch(r"(?:[a-z]\.)+[a-z]", word):
+            continue
+        # Lowercase sentence starts are normal in technical prose
+        # ("scheduleRetryBackoff ..."), so only digits and closing
+        # punctuation suppress a boundary.
+        if not next_char or next_char.isdigit() or next_char in ",;:)":
+            continue
+        parts.append(text[start:end])
+        start = end
+    parts.append(text[start:])
+    return [part.strip() for part in parts if part.strip()]
+
+
+def _sentence_protect_enabled() -> bool:
+    return _env_bool("APPEND_COMPACT_SENTENCE_PROTECT", True)
+
+
+def _rate_control_enabled() -> bool:
+    return _env_bool("APPEND_COMPACT_RATE_CONTROL", True)
+
+
+_LOG_LINE_RE = re.compile(
+    r"(?m)^\s*(?:20\d{2}-\d{2}-\d{2}[T ]\d{2}:\d{2}|\[?\d{2}:\d{2}:\d{2}"
+    r"|(?:INFO|WARN|WARNING|DEBUG|TRACE|ERROR)\b)"
+)
+_INSTRUCTION_RE = re.compile(
+    r"\b(?:must|should|ensure|make sure|do not|don't|never|always|please|"
+    r"required|need to|remember to|run|install|use|set|add|remove|update|"
+    r"implement|fix|avoid)\b",
+    re.IGNORECASE,
+)
+
+
+def _prose_rate(text: str) -> float:
+    """Keep more of instruction-like prose, less of repetitive log-like prose.
+
+    Masked literals and pinned facts survive at any rate; the rate only controls
+    how aggressively connective prose is pruned.  Values are deliberately close
+    to the 0.4 default: a large swing changes meaning, not just length.
+    """
+    if not _rate_control_enabled():
+        return DEFAULT_RATE
+    log_lines = len(_LOG_LINE_RE.findall(text))
+    digits = sum(1 for char in text if char.isdigit())
+    if log_lines >= 2 or (text and digits / len(text) > 0.18):
+        return 0.25
+    if len(_INSTRUCTION_RE.findall(text)) >= 2:
+        return 0.55
+    return DEFAULT_RATE
 
 
 def compress_prose(
@@ -1292,7 +3407,9 @@ def compress_prose(
     identifiers are masked before the model sees the text and restored after;
     any mask lost by the compressor forces a safe fallback.
     """
-    rate = DEFAULT_RATE if rate is None else rate
+    if rate is None:
+        rate = _prose_rate(text)
+    protect = _sentence_protect_enabled()
     stripped = text.strip()
     if not stripped:
         return text, "empty"
@@ -1313,7 +3430,7 @@ def compress_prose(
     if _cache_enabled() and compressor is _default_llm_compress:
         try:
             model = os.environ.get("APPEND_COMPACT_LLM_MODEL", LLMLINGUA_MODEL).strip() or LLMLINGUA_MODEL
-            key = _compress_cache_key(text, rate, model)
+            key = _compress_cache_key(text, rate, model, "sentence" if protect else "")
             cache_path = default_cache_dir() / "compressed" / key[:2] / f"{key}.json"
             cached = _read_cached_compression(cache_path)
         except (OSError, RuntimeError, ValueError) as exc:
@@ -1325,7 +3442,28 @@ def compress_prose(
 
     masked, placeholders, mapping = _mask_entities(text)
     try:
-        compressed = compressor(masked, rate, placeholders)
+        if protect:
+            sentences = _split_sentences(masked)
+            if len(sentences) >= 3:
+                first, last = sentences[0], sentences[-1]
+                middle = " ".join(sentences[1:-1])
+                # A short middle still gets its own compression: the point of
+                # this path is the verbatim boundaries, not the middle's ratio.
+                if len(middle) >= 40:
+                    middle_placeholders = [p for p in placeholders if p in middle]
+                    compressed_middle = compressor(middle, rate, middle_placeholders)
+                    if compressed_middle and all(
+                        p in compressed_middle for p in middle_placeholders
+                    ):
+                        compressed = f"{first} {compressed_middle.strip()} {last}"
+                    else:
+                        compressed = None
+                else:
+                    compressed = compressor(masked, rate, placeholders)
+            else:
+                compressed = compressor(masked, rate, placeholders)
+        else:
+            compressed = compressor(masked, rate, placeholders)
     except Exception as exc:
         _log_error(f"prose compressor raised: {exc!r}")
         compressed = None
@@ -1380,6 +3518,8 @@ def compress_text(text: str, llm: Any = "auto") -> tuple[str, dict[str, int]]:
     stats = {
         "code_blocks": 0,
         "json_blocks": 0,
+        "code_skeleton_blocks": 0,
+        "code_block_ids": [],
         "llm_blocks": 0,
         "fallback_blocks": 0,
         "error_blocks": 0,
@@ -1409,10 +3549,19 @@ def _ledger_lines(entities: list[str]) -> list[str]:
     return lines
 
 
-def _chunk_block(number: int, entities: list[str], text: str, source: str) -> str:
+def _chunk_block(
+    number: int,
+    entities: list[str],
+    text: str,
+    source: str,
+    raw_id: str | None = None,
+) -> str:
     lines = [f"### Summary Chunk #{number}"]
     if source:
         lines.append(f"Source: {source}")
+    if raw_id:
+        # A pointer, not the text: the id is enough to recover the full turn.
+        lines.append(f"Raw: {raw_id[:12]}")
     lines.extend(_ledger_lines(entities))
     lines.append("**Turn:**")
     lines.append(text.strip())
@@ -1455,12 +3604,41 @@ def _chunk_range_label(numbers: list[int]) -> str:
     return ", ".join(parts)
 
 
-def _build_master(
-    state: dict[str, Any],
+def _chunk_code_ids(chunk: dict[str, Any]) -> list[str]:
+    """Raw ids of skeletonized blocks in a chunk.
+
+    New chunks carry them in ``stats["code_block_ids"]``.  Fall back to the
+    placeholder text so chunks written before that field still get pointers
+    when a new master is built.  Existing masters are never rewritten.
+    """
+    found: set[str] = set()
+    stats = chunk.get("stats")
+    if isinstance(stats, dict):
+        for value in stats.get("code_block_ids") or []:
+            if isinstance(value, str) and _RAW_ID_RE.fullmatch(value):
+                found.add(value)
+    text = chunk.get("compressed_text")
+    if isinstance(text, str):
+        found.update(_SKELETON_RAW_ID_RE.findall(text))
+    return sorted(found)
+
+
+def _chunk_pointer_lines(chunk: dict[str, Any]) -> list[str]:
+    """Recovery pointers placed before an L2 digest, so a cut cannot hide them."""
+    lines: list[str] = []
+    raw_id = chunk.get("raw_id")
+    if isinstance(raw_id, str) and _RAW_ID_RE.fullmatch(raw_id):
+        lines.append(f"Raw: {raw_id[:12]}")
+    code_ids = _chunk_code_ids(chunk)
+    if code_ids:
+        lines.append("Code: " + ", ".join(block_id[:12] for block_id in code_ids))
+    return lines
+
+
+def _render_master_block(
+    number: int,
     batch: list[dict[str, Any]],
-    session: str | None = None,
-) -> dict[str, Any]:
-    number = len(state.get("l2_masters", [])) + 1
+) -> tuple[str, list[int], list[str]]:
     covered = [int(chunk["n"]) for chunk in batch]
     entities = _merge_entities(*[chunk.get("entities", []) for chunk in batch])
     lines = [
@@ -1471,14 +3649,25 @@ def _build_master(
     lines.append("**Chunk Digests:**")
     for chunk in batch:
         lines.append(f"#### Chunk #{chunk['n']}")
+        lines.extend(_chunk_pointer_lines(chunk))
         lines.append(_digest(chunk.get("compressed_text", ""), L2_DIGEST_CHARS))
+    return "\n".join(lines), covered, entities
+
+
+def _build_master(
+    state: dict[str, Any],
+    batch: list[dict[str, Any]],
+    session: str | None = None,
+) -> dict[str, Any]:
+    number = len(state.get("l2_masters", [])) + 1
+    block, covered, entities = _render_master_block(number, batch)
     return {
         "n": number,
         "created": _now(),
         "covered": covered,
         "entities": entities,
         "session": session,
-        "block": "\n".join(lines),
+        "block": block,
     }
 
 
@@ -1516,6 +3705,7 @@ def append_turn(
     if not compressed.strip():
         return None
 
+    raw_id = archive_raw(text)
     number = max((int(chunk.get("n", 0)) for chunk in state.get("l1_chunks", [])), default=0) + 1
     entities = _merge_entities(extract_entities(text), extract_entities(compressed))
     key = capture_key or _capture_key(text, strip_role=source == "precompact")
@@ -1531,17 +3721,24 @@ def append_turn(
         "capture_key": key,
         "entities": entities,
         "compressed_text": compressed,
-        "block": _chunk_block(number, entities, compressed, source),
+        "block": _chunk_block(number, entities, compressed, source, raw_id),
+        "raw_id": raw_id,
         "stats": stats,
     }
     state.setdefault("l1_chunks", []).append(chunk)
     _record_recent_capture(state, text, source, role, session, captured_at)
+    _record_goals_for_turn(state, text, session, number, role)
+    chunk["handoff"] = _handoff_from_turn(text, number, role)
+    if _journal_enabled():
+        tags = _harvest_tags(text, number, state, session)
+        if tags:
+            chunk["tags"] = tags
 
     totals = state.setdefault("stats", {})
     totals["turns"] = int(totals.get("turns", 0)) + 1
     totals["bytes_in"] = int(totals.get("bytes_in", 0)) + stats["bytes_in"]
     totals["bytes_out"] = int(totals.get("bytes_out", 0)) + stats["bytes_out"]
-    for key in ("llm_blocks", "fallback_blocks", "error_blocks"):
+    for key in ("llm_blocks", "fallback_blocks", "error_blocks", "code_skeleton_blocks"):
         totals[key] = int(totals.get(key, 0)) + stats.get(key, 0)
 
     # Keep every existing chunk dict byte-identical; the master records which
@@ -1624,6 +3821,7 @@ def enqueue_turn(
     if dedupe and _already_captured(state, input_sha, session):
         return None
     key = capture_key or _capture_key(text, strip_role=source == "precompact")
+    raw_id = archive_raw(text)
     job = {
         "id": uuid.uuid4().hex,
         "session": session,
@@ -1634,6 +3832,7 @@ def enqueue_turn(
         "status": "pending",
         "input_sha": input_sha,
         "capture_key": key,
+        "raw_id": raw_id,
         "entities": extract_entities(text),
         "text": text[:PENDING_MAX_CHARS],
     }
@@ -1776,17 +3975,25 @@ def commit_job(
         or _capture_key(str(entry.get("text", "")), strip_role=source == "precompact"),
         "entities": entities,
         "compressed_text": compressed,
-        "block": _chunk_block(number, entities, compressed, source),
+        "block": _chunk_block(number, entities, compressed, source, entry.get("raw_id")),
+        "raw_id": entry.get("raw_id"),
         "stats": stats,
     }
     state.setdefault("l1_chunks", []).append(chunk)
     state["pending"].remove(entry)
+    _record_goals_for_turn(state, str(entry.get("text", "")), session, number, entry.get("role"))
+    raw_text = str(entry.get("text", ""))
+    chunk["handoff"] = _handoff_from_turn(raw_text, number, entry.get("role"))
+    if _journal_enabled():
+        tags = _harvest_tags(raw_text, number, state, session)
+        if tags:
+            chunk["tags"] = tags
 
     totals = state.setdefault("stats", {})
     totals["turns"] = int(totals.get("turns", 0)) + 1
     totals["bytes_in"] = int(totals.get("bytes_in", 0)) + int(stats.get("bytes_in", 0))
     totals["bytes_out"] = int(totals.get("bytes_out", 0)) + int(stats.get("bytes_out", 0))
-    for key in ("llm_blocks", "fallback_blocks", "error_blocks"):
+    for key in ("llm_blocks", "fallback_blocks", "error_blocks", "code_skeleton_blocks"):
         totals[key] = int(totals.get(key, 0)) + int(stats.get(key, 0))
     consolidate_if_needed(state, session)
     return chunk
@@ -2071,21 +4278,39 @@ def _global_ledger_block(state: dict[str, Any], limit: int, session: str | None 
     """Deterministic union of every pinned entity, kept at the stable head.
 
     Masters get dropped from the injection when the cap is tight, so this
-    ledger is what keeps old file paths and symbol names alive.
+    ledger is what keeps old file paths and symbol names alive.  Entries are
+    grouped by kind (``fact:``, ``path:``, ``symbol:``) so a long session's
+    facts fit in the same budget as one-entry-per-line would allow.
     """
     entities = _global_entities(state, session)
     if not entities or limit <= 0:
         return ""
     header = "**Entity Ledger (pinned):**"
+    groups: dict[str, list[str]] = {}
+    for entry in entities:
+        kind, sep, value = entry.partition(": ")
+        if not sep:
+            kind, value = "misc", entry
+        groups.setdefault(kind, []).append(value)
     lines = [header]
     used = len(header) + 1
-    for entry in entities:
-        line = f"- {entry}"
-        if used + len(line) + 1 > limit:
+    truncated = False
+    for kind in sorted(groups):
+        current = f"- {kind}: "
+        emitted = 0
+        for value in groups[kind]:
+            piece = value if emitted == 0 else f"; {value}"
+            if used + len(current) + len(piece) + 1 > limit:
+                truncated = True
+                break
+            current += piece
+            emitted += 1
+        if emitted:
+            lines.append(current)
+            used += len(current) + 1
+        if truncated:
             lines.append(f"- … {len(entities)} entities pinned, list truncated")
             break
-        lines.append(line)
-        used += len(line) + 1
     return "\n".join(lines)
 
 
@@ -2124,57 +4349,725 @@ def _pack_recent(blocks: list[str], budget: int) -> tuple[str, int]:
     return "\n\n".join(kept), dropped
 
 
+def _l3_index_header() -> str:
+    return (
+        "**L3 Index (older context; zstd --ultra -22 files under "
+        f"{_l3_base_display()}/; scan: ugrep -z PATTERN FILE "
+        "(zstdgrep also works), read: zstd -dc FILE):**"
+    )
+
+# Tokens that carry topic in a prompt but not across unrelated prompts.  Paths
+# and symbols are deliberately kept: two turns about the same module should
+# look similar even when their prose differs.
+_DRIFT_TOKEN_RE = re.compile(r"[\w.:/-]{3,}", re.UNICODE)
+_DRIFT_STOPWORDS = frozenset(
+    """
+    the and for with from into over under this that these those then than
+    there their they them your you our ours was were been being have has had
+    will would should could can may might must not yes now also just only
+    more most other some such very about after before again further once
+    here when where why how all any both each few own same too use used using
+    make made get got add added run ran fix fixed check checked do does did
+    done new old first last next previous current file files code test tests
+    function functions line lines text data context prompt prompts token
+    tokens compact compactor compaction plugin default enabled enable disable
+    please want need needs like work works working implementation implement
+    implemented change changes changed update updated updating
+    """.split()
+)
+
+
+def _drift_signature(text: str) -> set[str]:
+    tokens = {match.lower() for match in _DRIFT_TOKEN_RE.findall(text)}
+    return {token for token in tokens if token not in _DRIFT_STOPWORDS}
+
+
+def _drift_decision(
+    state: dict[str, Any],
+    session: str | None,
+    prompt: str | None,
+) -> tuple[bool, float, int]:
+    """Whether the current prompt looks unrelated to recent user prompts.
+
+    Returns ``(active, best_overlap, compared)``.  Short prompts are treated as
+    follow-ups, not drift; fewer than two substantive prior prompts cannot
+    establish a topic.  This is a local, deterministic statistic: no model and
+    no extra state.
+    """
+    if not _env_bool("APPEND_COMPACT_L3_DRIFT", True) or not prompt:
+        return False, 1.0, 0
+    window = _env_int("APPEND_COMPACT_L3_DRIFT_WINDOW", DEFAULT_L3_DRIFT_WINDOW)
+    min_tokens = _env_int(
+        "APPEND_COMPACT_L3_DRIFT_MIN_TOKENS", DEFAULT_L3_DRIFT_MIN_TOKENS
+    )
+    threshold = _env_float(
+        "APPEND_COMPACT_L3_DRIFT_THRESHOLD", DEFAULT_L3_DRIFT_THRESHOLD
+    )
+    current = _drift_signature(prompt)
+    if len(current) < min_tokens:
+        return False, 1.0, 0
+
+    prior: list[set[str]] = []
+    for chunk in state.get("l1_chunks", []):
+        if not _belongs(chunk, session):
+            continue
+        if chunk.get("role") != "user" and chunk.get("source") != "user_prompt":
+            continue
+        signature = _drift_signature(str(chunk.get("compressed_text", "")))
+        if len(signature) >= min_tokens:
+            prior.append(signature)
+    prior = prior[-window:]
+    if len(prior) < 2:
+        return False, 1.0, len(prior)
+
+    best = 0.0
+    for signature in prior:
+        overlap = len(current & signature) / min(len(current), len(signature))
+        best = max(best, overlap)
+    return best < threshold, best, len(prior)
+
+
+def _l3_keep_recent(drift: bool) -> tuple[int, int]:
+    if drift:
+        masters = _env_int(
+            "APPEND_COMPACT_L3_DRIFT_KEEP_RECENT_MASTERS",
+            DEFAULT_L3_DRIFT_KEEP_RECENT_MASTERS,
+        )
+        chunks = _env_int(
+            "APPEND_COMPACT_L3_DRIFT_KEEP_RECENT_CHUNKS",
+            DEFAULT_L3_DRIFT_KEEP_RECENT_CHUNKS,
+        )
+    else:
+        masters = _env_int(
+            "APPEND_COMPACT_L3_KEEP_RECENT_MASTERS",
+            DEFAULT_L3_KEEP_RECENT_MASTERS,
+        )
+        chunks = _env_int(
+            "APPEND_COMPACT_L3_KEEP_RECENT_CHUNKS",
+            DEFAULT_L3_KEEP_RECENT_CHUNKS,
+        )
+    return masters, chunks
+
+
+def _l3_clean_text(text: str) -> str:
+    """Prose for summaries: drop headings, pointers and ledger lines."""
+    lines: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#") or line.startswith("**Turn:**"):
+            continue
+        if line.startswith(("Source:", "Raw:", "Code:", "Files:", "Covers ")):
+            continue
+        if line.startswith(("- path:", "- symbol:", "- fact:")):
+            continue
+        lines.append(line)
+    return " ".join(" ".join(lines).split())
+
+
+def _l3_summary(text: str, limit: int) -> str:
+    cleaned = _l3_clean_text(text)
+    if not cleaned:
+        return ""
+    summary = _digest(cleaned, limit).replace("\n", " ")
+    return summary.rstrip()
+
+
+def _l3_signal(entities: list[Any], limit: int = DEFAULT_L3_ENTITY_CHARS) -> str:
+    """Compact high-signal entities for an index line (paths, symbols, facts)."""
+    paths: list[str] = []
+    symbols: list[str] = []
+    facts: list[str] = []
+    for entry in entities:
+        if not isinstance(entry, str):
+            continue
+        if entry.startswith("path: "):
+            paths.append(entry[6:].strip())
+        elif entry.startswith("symbol: "):
+            symbols.append(entry[8:].strip())
+        elif entry.startswith("fact: "):
+            facts.append(entry[6:].strip())
+    chosen: list[str] = []
+    for value in paths[:2] + symbols[:2] + facts[:2]:
+        value = " ".join(value.split())
+        if len(value) > 36:
+            value = value[:35].rstrip() + "…"
+        if value and value not in chosen:
+            chosen.append(value)
+    text = ", ".join(chosen)
+    if len(text) > limit:
+        text = text[: limit - 1].rstrip(", ") + "…"
+    return text
+
+
+_L3_KEYWORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./:-]{2,}", re.UNICODE)
+_L3_KEYWORD_STOPWORDS = _DRIFT_STOPWORDS | frozenset(
+    """
+    none true false self cls return import from def class method var let const
+    if else elif while try except finally with as in is not and or pass break
+    continue yield lambda async await print len str int float bool list dict
+    set tuple object value values key keys item items index result results
+    name names path paths file files line lines start end get add
+    read write open close init main args kwargs payload response request
+    status output input text chunk chunks master masters block blocks
+    content message messages user assistant tool module modules
+    function functions test tests error errors code
+    """.split()
+)
+
+
+def _l3_keyword_tokens(text: str) -> list[str]:
+    tokens: list[str] = []
+    for token in _L3_KEYWORD_RE.findall(_l3_clean_text(text)):
+        lowered = token.lower()
+        if lowered in _L3_KEYWORD_STOPWORDS:
+            continue
+        if "." in lowered and lowered.split(".", 1)[0] in _L3_KEYWORD_STOPWORDS:
+            continue
+        tokens.append(lowered)
+    return tokens
+
+
+def _l3_keyword_corpus(sources: list[str]) -> tuple[dict[str, int], int]:
+    """Document frequency over the session's candidate blocks."""
+    df: dict[str, int] = {}
+    for text in sources:
+        for token in set(_l3_keyword_tokens(text)):
+            df[token] = df.get(token, 0) + 1
+    return df, len(sources)
+
+
+def _l3_keywords(
+    text: str,
+    df: dict[str, int],
+    n_docs: int,
+    count: int = DEFAULT_L3_KEYWORDS,
+    exclude: set[str] | None = None,
+) -> str:
+    """Top TF-IDF tokens: what the rest of this block is about.
+
+    Entities alone describe *where* a block points; keywords describe *what*
+    it says, including content that never appears in a path or symbol.
+    """
+    tf: dict[str, int] = {}
+    for token in _l3_keyword_tokens(text):
+        tf[token] = tf.get(token, 0) + 1
+    if not tf:
+        return ""
+    blocked = exclude or set()
+
+    def weight(token: str) -> float:
+        return tf[token] * math.log((n_docs + 1) / (df.get(token, 1) + 1.0))
+
+    ranked = sorted(tf, key=lambda token: (-weight(token), -len(token), token))
+    chosen: list[str] = []
+    for token in ranked:
+        if token in blocked:
+            continue
+        if any(token in kept or kept in token for kept in chosen):
+            continue
+        chosen.append(token)
+        if len(chosen) >= max(0, count):
+            break
+    return ", ".join(chosen)
+
+
+_L3_NUMBER_RE = re.compile(_NUMERIC_LITERAL_PATTERN)
+
+
+def _l3_numbers(text: str, limit: int = 2) -> list[str]:
+    """Exact numeric literals (versions, decimals, units) for an index line.
+
+    The fact ledger deliberately skips bare numbers, so without this an old
+    block's distinctive value (``0.25``, ``250ms``) disappears when L3 demotes
+    the block to one line.  Only literals ``_NUMERIC_LITERAL_PATTERN`` accepts
+    are used -- no bare integers from line counts or skeleton markers.
+    """
+    found: list[str] = []
+    for match in _L3_NUMBER_RE.finditer(text):
+        value = match.group(0)
+        if value and value not in found:
+            found.append(value)
+            if len(found) >= max(0, limit):
+                break
+    return found
+
+
+def _l3_master_source(master: dict[str, Any]) -> str:
+    block = str(master.get("block", ""))
+    return block.split("**Chunk Digests:**", 1)[-1] or block
+
+
+def _l3_chunk_source(chunk: dict[str, Any]) -> str:
+    return str(chunk.get("compressed_text", "")) or str(chunk.get("block", ""))
+
+
+def _l3_item(
+    kind: str,
+    number: int,
+    label: str,
+    block: str,
+    summary_source: str,
+    entities: list[Any] | None = None,
+    df: dict[str, int] | None = None,
+    n_docs: int = 0,
+) -> dict[str, Any]:
+    block_id = l3_id_for(block)
+    entity_signal = _l3_signal(entities or [])
+    excluded = set(_l3_keyword_tokens(entity_signal))
+    numeric = [value for value in _l3_numbers(summary_source) if value not in excluded]
+    excluded.update(_l3_keyword_tokens(" ".join(numeric)))
+    keyword_signal = _l3_keywords(
+        summary_source, df or {}, n_docs, DEFAULT_L3_KEYWORDS, excluded
+    )
+    number_signal = ", ".join(numeric)
+    signals = [part for part in (entity_signal, number_signal, keyword_signal) if part]
+    summary = " | ".join(signals) or _l3_summary(
+        summary_source, DEFAULT_L3_SUMMARY_CHARS
+    )
+    suffix = f" {summary}" if summary else ""
+    line = (
+        f"- {kind} #{number} [{label}]{suffix} | "
+        f"{_l3_file_link(block_id)}"
+    )
+    return {
+        "kind": kind,
+        "n": number,
+        "block": block,
+        "id": block_id,
+        "line": line,
+    }
+
+
+def _l3_master_item(
+    master: dict[str, Any],
+    df: dict[str, int] | None = None,
+    n_docs: int = 0,
+) -> dict[str, Any]:
+    block = str(master.get("block", ""))
+    covered = [int(n) for n in master.get("covered") or [] if isinstance(n, int)]
+    label = f"chunks {_chunk_range_label(covered)}"
+    return _l3_item(
+        "L2",
+        int(master.get("n", 0)),
+        label,
+        block,
+        _l3_master_source(master),
+        master.get("entities") or [],
+        df,
+        n_docs,
+    )
+
+
+def _l3_chunk_item(
+    chunk: dict[str, Any],
+    df: dict[str, int] | None = None,
+    n_docs: int = 0,
+) -> dict[str, Any]:
+    block = str(chunk.get("block", ""))
+    label = str(chunk.get("source") or "turn")
+    return _l3_item(
+        "L1",
+        int(chunk.get("n", 0)),
+        label,
+        block,
+        _l3_chunk_source(chunk),
+        chunk.get("entities") or [],
+        df,
+        n_docs,
+    )
+
+
+def _pack_full_candidates(
+    candidates: list[dict[str, Any]],
+    budget: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+    """Keep newest full candidates that fit; return the rest newest-first."""
+    if budget <= 0 or not candidates:
+        return [], list(reversed(candidates)), 0
+    kept: list[dict[str, Any]] = []
+    total = 0
+    for position in range(len(candidates) - 1, -1, -1):
+        item = candidates[position]
+        cost = len(str(item.get("block", ""))) + (2 if kept else 0)
+        if total + cost > budget:
+            return kept[::-1], list(reversed(candidates[: position + 1])), total
+        kept.append(item)
+        total += cost
+    return kept[::-1], [], total
+
+
+def _pack_l3_index(
+    entries: list[dict[str, Any]],
+    budget: int,
+) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
+    """Write selected L3 files and render index lines that fit ``budget``."""
+    if budget <= 0 or not entries:
+        return "", [], entries
+    header = _l3_index_header()
+    header_cost = len(header) + 1
+    if header_cost >= budget:
+        return "", [], entries
+    used = header_cost
+    lines = [header]
+    written: list[dict[str, Any]] = []
+    dropped: list[dict[str, Any]] = []
+    for entry in entries:
+        cost = len(entry["line"]) + 1
+        if used + cost > budget:
+            dropped.append(entry)
+            continue
+        if archive_l3(entry["block"], entry["id"]) is None:
+            dropped.append(entry)
+            continue
+        lines.append(entry["line"])
+        used += cost
+        written.append(entry)
+    return ("\n".join(lines) if written else ""), written, dropped
+
+
 def injection_payload(
     state: dict[str, Any],
     max_chars: int | None = None,
     event_name: str = "UserPromptSubmit",
     session: str | None = None,
+    prompt: str | None = None,
 ) -> dict[str, Any] | None:
     """Bounded payload: pinned ledger head, newest L2 masters, newest active L1.
 
     ``session`` isolates parallel Claude contexts: a context receives only the
     chunks and masters captured under its own session id, never a peer's.
+
+    With L3 enabled (the default), older masters/chunks become one-line index
+    entries with a verified file link instead of full blocks.  The index always
+    follows the unchanged ledger and newest full masters, so this is a change
+    to the *new* injection only; existing conversation messages are never
+    rewritten.
     """
     max_chars = _clamp_inject_chars(
         max_chars or _env_int("APPEND_COMPACT_MAX_INJECT_CHARS", DEFAULT_MAX_INJECT_CHARS)
     )
     masters = [
-        master["block"] for master in state.get("l2_masters", [])
+        master for master in state.get("l2_masters", [])
         if master.get("block") and _belongs(master, session)
     ]
-    active = [chunk["block"] for chunk in active_l1(state, session) if chunk.get("block")]
-    if not masters and not active:
+    active_chunks = [
+        chunk for chunk in active_l1(state, session) if chunk.get("block")
+    ]
+    if not masters and not active_chunks:
         return None
 
     note = "\n\n[append-compactor: older context omitted to fit the 10k hook cap]"
-    ledger = _global_ledger_block(state, min(LEDGER_BUDGET_CHARS, max_chars // 4), session)
-    budget = max_chars - (len(ledger) + 2 if ledger else 0) - len(note)
+    l3_enabled = _l3_enabled()
+    if not l3_enabled:
+        target = max_chars
+        drift, drift_score, drift_compared = False, 1.0, 0
+        keep_masters, keep_chunks = 0, 0
+        recent_masters, old_masters = [], list(masters)
+        recent_chunks, old_chunks = [], list(active_chunks)
+        l3_present = False
+    else:
+        target = min(
+            max_chars,
+            _env_int("APPEND_COMPACT_L3_TARGET_CHARS", DEFAULT_L3_TARGET_CHARS),
+        )
+        target = max(1, target)
+        drift, drift_score, drift_compared = _drift_decision(state, session, prompt)
+        keep_masters, keep_chunks = _l3_keep_recent(drift)
+        recent_masters = masters[-keep_masters:] if keep_masters else []
+        old_masters = masters[:-keep_masters] if keep_masters else list(masters)
+        recent_chunks = active_chunks[-keep_chunks:] if keep_chunks else []
+        old_chunks = active_chunks[:-keep_chunks] if keep_chunks else list(active_chunks)
+        l3_present = bool(old_masters or old_chunks)
 
-    # Live turns outrank historical masters.
-    active_budget = budget if not masters else min(budget, max(1_500, budget // 2))
-    active_text, dropped_active = _pack_recent(active, active_budget)
-    remaining = budget - (len(active_text) + 2 if active_text else 0)
-    master_text, dropped_masters = _pack_recent(masters, remaining)
+    present = {
+        "L1": bool(active_chunks),
+        "L2": bool(masters),
+        "L3": l3_present,
+    }
+    goal_sections = _render_goal_anchors(state, session, present, drift=drift)
+    anchor_reserve = sum(len(text) for _, text in goal_sections)
+    if goal_sections:
+        anchor_reserve += 2 * max(0, len(goal_sections) - 1)
+    # Pack the stable head (ledger + L2 masters) first.  For tail/after-head
+    # placements the anchor lives after the head, so the no-anchor budget keeps
+    # the cached head byte-identical.  For beginning/hybrid the anchor *is* part
+    # of the head, so reserve its bytes before packing or it would be dropped
+    # under a tight budget instead of the volatile tail.
+    placement = _goal_placement()
+    base_content_cap = max(1, target - len(note))
+    head_reserve = 0
+    if placement in {"beginning", "hybrid"} and goal_sections:
+        # Only the leading anchor lives in the head; a hybrid reminder is
+        # volatile and is charged to content_cap below.
+        head_reserve = len(goal_sections[0][1]) + 2
+    head_cap = max(1, base_content_cap - head_reserve)
+    content_cap = max(1, base_content_cap - anchor_reserve)
+    ledger = _global_ledger_block(
+        state, min(LEDGER_BUDGET_CHARS, head_cap // 4), session
+    )
+    ledger_len = len(ledger) + 2 if ledger else 0
+    # The handoff is additive: it never replaces the ledger, the masters or the
+    # active chunks, and it lives in the volatile half of the block so the
+    # cached head stays byte-identical from turn to turn.  It is rendered
+    # *after* the rest is packed -- see below -- because its whole value is
+    # carrying facts the packed view no longer shows.
+    handoff_text = ""
+    journal_note = ""
+    handoff_meta: dict[str, Any] = {
+        "enabled": _handoff_enabled(), "sections": 0, "items": 0, "chars": 0,
+    }
+    # Reserve room up front, but render only after packing: packing always
+    # fills the budget, so a section that waits for leftovers would never fit.
+    handoff_reserve = 0
+    if _handoff_enabled() and target >= 1_200:
+        handoff_reserve = min(_handoff_cap(), max(200, target // 8))
+        content_cap = max(1, content_cap - handoff_reserve)
 
-    pieces = [part for part in (ledger, master_text, active_text) if part]
-    text = "\n\n".join(pieces).strip()
-    if dropped_active or dropped_masters:
-        text += note
-    if len(text) > max_chars:  # final hard guard; also keeps us under 10k
-        text = _truncate_at_line(text, max_chars)
+    if not l3_enabled:
+        master_blocks = [str(master["block"]) for master in masters]
+        active_blocks = [str(chunk["block"]) for chunk in active_chunks]
+        budget = head_cap - ledger_len - len(note)
+
+        # Live turns outrank historical masters.  Pack once at the full budget
+        # to freeze the head, then repack only the volatile active text when an
+        # anchor needs room.
+        active_budget = (
+            budget if not master_blocks else min(budget, max(1_500, budget // 2))
+        )
+        active_text_full, dropped_chunks_full = _pack_recent(
+            active_blocks, active_budget
+        )
+        remaining = budget - (len(active_text_full) + 2 if active_text_full else 0)
+        master_text, dropped_masters = _pack_recent(master_blocks, remaining)
+        if anchor_reserve:
+            volatile_budget = max(
+                0,
+                content_cap - ledger_len
+                - (len(master_text) + 2 if master_text else 0),
+            )
+            active_text, dropped_chunks = _pack_recent(active_blocks, volatile_budget)
+        else:
+            active_text, dropped_chunks = active_text_full, dropped_chunks_full
+        index_text = ""
+        l3_meta: dict[str, Any] = {"enabled": False}
+    else:
+        # One IDF corpus per session: keywords describe what each block says,
+        # while entities describe where it points.  Both are needed for an
+        # agent to judge whether a full block is worth reading.
+        corpus_sources = (
+            [_l3_master_source(master) for master in masters]
+            + [_l3_chunk_source(chunk) for chunk in active_chunks]
+        )
+        df, n_docs = _l3_keyword_corpus(corpus_sources)
+
+        master_items = [
+            _l3_master_item(master, df, n_docs) for master in recent_masters
+        ]
+        chunk_items = [
+            _l3_chunk_item(chunk, df, n_docs) for chunk in recent_chunks
+        ]
+
+        # Reserve index space for all old material first.  A full block is a
+        # convenience; an index line is what keeps the block discoverable.
+        old_chunk_entries = [
+            _l3_chunk_item(chunk, df, n_docs) for chunk in reversed(old_chunks)
+        ]
+        old_master_entries = [
+            _l3_master_item(master, df, n_docs) for master in reversed(old_masters)
+        ]
+        old_entries = old_chunk_entries + old_master_entries
+
+        index_cap = _env_int(
+            "APPEND_COMPACT_L3_INDEX_BUDGET_CHARS", DEFAULT_L3_INDEX_BUDGET_CHARS
+        )
+        remaining = max(0, head_cap - ledger_len - len(note))
+        header_cost = len(_l3_index_header()) + 1
+        old_cost = header_cost + sum(len(entry["line"]) + 1 for entry in old_entries)
+        index_reserve = min(index_cap, old_cost) if old_entries else 0
+        full_budget = max(0, remaining - index_reserve)
+        if master_items and chunk_items:
+            active_budget = min(full_budget, max(1_500, full_budget // 2))
+            master_budget = max(0, full_budget - active_budget)
+        elif master_items:
+            master_budget, active_budget = full_budget, 0
+        else:
+            master_budget, active_budget = 0, full_budget
+
+        kept_masters, demoted_masters, used_masters = _pack_full_candidates(
+            master_items, master_budget
+        )
+        kept_chunks, demoted_chunks, used_chunks = _pack_full_candidates(
+            chunk_items, active_budget
+        )
+
+        if anchor_reserve:
+            # Keep the masters (head) exactly as packed without an anchor, but
+            # let the anchor consume the volatile tail.  Repacking can demote
+            # more active chunks; those are indexed below.
+            actual_chunk_budget = max(
+                0, content_cap - ledger_len - used_masters - 6
+            )
+            kept_chunks, demoted_chunks, used_chunks = _pack_full_candidates(
+                chunk_items, actual_chunk_budget
+            )
+
+        # Newest old material first: active chunks outrank covered masters.
+        index_entries: list[dict[str, Any]] = []
+        index_entries.extend(demoted_chunks)
+        index_entries.extend(old_chunk_entries)
+        index_entries.extend(demoted_masters)
+        index_entries.extend(old_master_entries)
+
+        index_available = max(
+            0, content_cap - ledger_len - used_masters - used_chunks - 6
+        )
+        index_text, index_written, index_dropped = _pack_l3_index(
+            index_entries, min(index_cap, index_available)
+        )
+
+        master_text = "\n\n".join(str(item["block"]) for item in kept_masters)
+        active_text = "\n\n".join(str(item["block"]) for item in kept_chunks)
+        dropped_masters = sum(
+            1 for entry in index_dropped if entry.get("kind") == "L2"
+        )
+        dropped_chunks = sum(
+            1 for entry in index_dropped if entry.get("kind") == "L1"
+        )
+        l3_meta = {
+            "enabled": True,
+            "target_chars": target,
+            "drift": drift,
+            "drift_score": round(drift_score, 3),
+            "drift_prompts": drift_compared,
+            "full_masters": len(kept_masters),
+            "index_masters": sum(
+                1 for entry in index_written if entry.get("kind") == "L2"
+            ),
+            "full_chunks": len(kept_chunks),
+            "index_chunks": sum(
+                1 for entry in index_written if entry.get("kind") == "L1"
+            ),
+            "total_masters": len(masters),
+            "total_chunks": len(active_chunks),
+            "represented_masters": len(kept_masters)
+            + sum(1 for entry in index_written if entry.get("kind") == "L2"),
+            "represented_chunks": len(kept_chunks)
+            + sum(1 for entry in index_written if entry.get("kind") == "L1"),
+            "dropped_masters": dropped_masters,
+            "dropped_chunks": dropped_chunks,
+            "omitted_masters": dropped_masters,
+            "omitted_chunks": dropped_chunks,
+        }
+
+    cap = target if l3_enabled else max_chars
+
+    def assemble(sections: list[tuple[str, str]]) -> tuple[str, str, str]:
+        """Return (text, head_text, volatile_text) for the current sections.
+
+        ``head_text`` is the byte-stable prefix: the part that stays identical
+        across turns unless the goal is revised (beginning placements) or a new
+        master/ledger entry arrives.  Only ``volatile_text`` should change turn
+        to turn, so it belongs after the anchor in the cached prefix.
+        """
+        placement = _goal_placement()
+        main = sections[0][1] if sections else ""
+        reminder = ""
+        if len(sections) > 1 and sections[1][0] == "reminder":
+            reminder = sections[1][1]
+        extra_note = note if (dropped_chunks or dropped_masters) else ""
+        if placement == "per_level":
+            per_level = {level: text for level, text in sections}
+            head_parts = [ledger, master_text]
+            volatile_parts = [
+                handoff_text, per_level.get("L2", ""), index_text,
+                per_level.get("L3", ""), active_text, per_level.get("L1", ""),
+                extra_note,
+            ]
+        elif placement == "beginning":
+            head_parts = [main, ledger, master_text]
+            volatile_parts = [handoff_text, index_text, active_text, extra_note]
+        elif placement == "after_head":
+            head_parts = [ledger, master_text]
+            volatile_parts = [main, handoff_text, index_text, active_text, extra_note]
+        elif placement == "hybrid":
+            head_parts = [main, ledger, master_text]
+            volatile_parts = [handoff_text, index_text, active_text, reminder, extra_note]
+        else:  # tail
+            head_parts = [ledger, master_text]
+            # The anchor stays last: tail placement exists so the instruction is
+            # the last thing read.
+            volatile_parts = [handoff_text, index_text, active_text, main, extra_note]
+        if journal_note and journal_note not in volatile_parts:
+            volatile_parts = volatile_parts + [journal_note]
+        head = "\n\n".join(part for part in head_parts if part)
+        volatile = "\n\n".join(part for part in volatile_parts if part)
+        assembled = "\n\n".join(
+            part for part in head_parts + volatile_parts if part
+        ).strip()
+        return assembled, head, volatile
+
+    text, head_text, volatile_text = assemble(goal_sections)
+    # Second pass: now that the packed view is known, keep only handoff facts
+    # it lost.  Anything still visible in the ledger, masters, index lines or
+    # live chunks is dropped, so the section cannot be a second copy of text
+    # the model is already reading.  It gets whatever budget is left, and
+    # nothing if that is too little to say something useful.
+    if _handoff_enabled() and target >= 1_200:
+        spare = min(handoff_reserve or _handoff_cap(), cap - len(text) - 4)
+        if spare >= 120:
+            handoff_text, handoff_meta = _render_handoff(
+                state, session, ledger, spare, rest_text=text
+            )
+            if handoff_text:
+                text, head_text, volatile_text = assemble(goal_sections)
+    # The journal prompt must be present from the first turn, when there is
+    # nothing to show yet -- otherwise the model is never asked to emit tags
+    # and the section can never fill.
+    if _journal_enabled() and JOURNAL_INSTRUCTION not in text:
+        if len(text) + len(JOURNAL_INSTRUCTION) + 2 <= cap:
+            journal_note = JOURNAL_INSTRUCTION
+            text, head_text, volatile_text = assemble(goal_sections)
+    if len(text) > cap and handoff_text:
+        # The handoff yields first: it is the newest section and the least
+        # established, while the anchor and the ledger are what the session has
+        # already been relying on.
+        overflow = len(text) - cap
+        handoff_text, handoff_meta = _render_handoff(
+            state, session, ledger, max(0, len(handoff_text) - overflow - 20)
+        )
+        text, head_text, volatile_text = assemble(goal_sections)
+    if len(text) > cap:
+        # Shrink the anchor next, never the other way around: the anchor is
+        # the one thing this feature exists to keep.
+        overflow = len(text) - cap
+        reduced = _render_goal_anchors(
+            state, session, present,
+            max_total=max(0, anchor_reserve - overflow - 20),
+            drift=drift,
+        )
+        text, head_text, volatile_text = assemble(reduced)
+        goal_sections = reduced
+    if len(text) > cap:
+        # Pathological cap (e.g. a 300-char test budget): drop the anchor and
+        # handoff, and fall back to the original truncation behaviour.
+        goal_sections = []
+        handoff_text = ""
+        text, head_text, volatile_text = assemble([])
+        text = _truncate_at_line(text, cap)
 
     blocks: list[dict[str, Any]] = []
-    head_text = "\n\n".join(part for part in (ledger, master_text) if part)
     if head_text:
         blocks.append({
             "type": "text",
             "text": head_text,
             "cache_control": {"type": "ephemeral"},
         })
-    if active_text:
+    if volatile_text:
         blocks.append({
             "type": "text",
-            "text": active_text,
+            "text": volatile_text,
             "cache_control": {"type": "ephemeral"},
         })
     if not blocks:
@@ -2199,12 +5092,15 @@ def injection_payload(
                 "plugin": PLUGIN_NAME,
                 "version": VERSION,
                 "l2_masters": len(masters),
-                "active_l1": len(active),
+                "active_l1": len(active_chunks),
                 "pending": pending_count(state, session),
                 "dropped_l2": dropped_masters,
-                "dropped_l1": dropped_active,
+                "dropped_l1": dropped_chunks,
                 "pinned_entities": len(_global_entities(state, session)),
                 "max_inject_chars": max_chars,
+                "l3": l3_meta,
+                "goals": _goal_metadata(state, session, goal_sections),
+                "handoff": handoff_meta,
             }
         },
     }
@@ -2239,15 +5135,22 @@ def shared_block_text(
     limit = max_chars or _env_int("APPEND_COMPACT_SHARED_CHARS", DEFAULT_MAX_INJECT_CHARS)
     limit = max(limit, len(SHARED_BLOCK_BANNER) + 200)
     ledger = _global_ledger_block(state, min(LEDGER_BUDGET_CHARS, limit // 4), session)
+    # Opt-in: a shared goal anchor is still session-scoped, and it changes only
+    # when the goal version changes, so the frozen bytes stay byte-stable
+    # between deliberate goal revisions.
+    goal_anchor = _render_shared_goal_anchor(
+        state, session, min(_goal_total_cap(), max(80, limit // 3))
+    )
     budget = (
         limit
         - len(SHARED_BLOCK_BANNER)
         - 2
         - (len(ledger) + 2 if ledger else 0)
+        - (len(goal_anchor) + 2 if goal_anchor else 0)
         - len(SHARED_BLOCK_NOTE)
     )
     master_text, dropped = _pack_recent(masters, budget)
-    pieces = [part for part in (SHARED_BLOCK_BANNER, ledger, master_text) if part]
+    pieces = [part for part in (SHARED_BLOCK_BANNER, ledger, master_text, goal_anchor) if part]
     text = "\n\n".join(pieces).strip()
     if dropped:
         text += SHARED_BLOCK_NOTE
@@ -2479,6 +5382,8 @@ def _preservation_instructions(state: dict[str, Any], session: str | None = None
         if cut > PRECOMPACT_INSTRUCTION_CAP // 2:
             head = head[:cut]
         text = head.rstrip("; ") + "; …"
+    if _journal_enabled():
+        text = text + "\n\n" + JOURNAL_INSTRUCTION
     return text
 
 
@@ -2500,7 +5405,7 @@ def handle_prompt_event(
         # Build context from history *before* appending the current prompt, so
         # the prompt is never duplicated back to the model.  Only this
         # session's chunks are eligible.
-        output = injection_payload(state, session=session)
+        output = injection_payload(state, session=session, prompt=prompt)
 
     queue_or_append(state, prompt, "user_prompt", session, background, role="user")
 
@@ -2702,6 +5607,42 @@ def self_test(verbose: bool = False) -> bool:
         and drained["l1_chunks"][0]["stats"]["llm_blocks"] == 0,
     )
 
+    previous_goals = os.environ.get("APPEND_COMPACT_GOALS")
+    try:
+        os.environ["APPEND_COMPACT_GOALS"] = "1"
+        goal_probe = new_state()
+        append_turn(
+            goal_probe,
+            "Goal: keep the public API stable.\nConstraints:\n- Must not rename exports",
+            llm="off",
+        )
+        for index in range(6):
+            append_turn(goal_probe, f"goal probe turn {index} src/goal_{index}.py", llm="off")
+        goal_payload = injection_payload(goal_probe, max_chars=5_000)
+        goal_text = goal_payload["additional_context"] if goal_payload else ""
+        check(
+            "known-positive: explicit goal is anchored verbatim at the beginning",
+            'Goal (verbatim): "keep the public API stable."' in goal_text
+            and "Must not rename exports" in goal_text
+            and goal_text.startswith("[GOAL ANCHOR"),
+        )
+        check(
+            "known-positive: beginning anchor leads the stable head",
+            bool(goal_payload)
+            and goal_payload["content_blocks"][0]["text"].startswith("[GOAL ANCHOR"),
+        )
+        plain_probe = new_state()
+        append_turn(plain_probe, "Please continue with the next step.", llm="off")
+        check(
+            "known-negative: no goal marker, no anchored goal",
+            _session_goal_store(plain_probe, None, create=False) is None,
+        )
+    finally:
+        if previous_goals is None:
+            os.environ.pop("APPEND_COMPACT_GOALS", None)
+        else:
+            os.environ["APPEND_COMPACT_GOALS"] = previous_goals
+
     shared_first = shared_block_text(probe)
     check(
         "known-positive: shared block is byte-stable",
@@ -2753,6 +5694,93 @@ def self_test(verbose: bool = False) -> bool:
                 os.environ.pop("APPEND_COMPACT_CACHE_DIR", None)
             else:
                 os.environ["APPEND_COMPACT_CACHE_DIR"] = original_cache_dir
+
+    handoff_turn = _handoff_from_turn(
+        "Turn 4: please set the export worker to 8 shards and keep "
+        "src/export/csv_writer.py on line 64.",
+        4,
+        "user",
+    )
+    values_flat = " ".join(item for item, _ in handoff_turn.get("critical_exact_values", []))
+    files_flat = " ".join(item for item, _ in handoff_turn.get("files_symbols_references", []))
+    check(
+        "known-positive: handoff copies an exact value and a path",
+        "8 shards" in values_flat and "src/export/csv_writer.py" in files_flat,
+    )
+    check(
+        "known-negative: tool output is not a handoff fact",
+        not any(_handoff_from_turn("pytest -q -> 214 passed, 3 skipped in 8.4s", 9, "tool").values()),
+    )
+    check(
+        "known-positive: a contiguous copy grounds",
+        _grounded("port 8443", "the metrics listener is on port 8443."),
+    )
+    check(
+        "known-negative: an invented fact does not ground",
+        not _grounded("MERGE_STALL_TIMEOUT_S 30.0", "we should add a merge stall timeout."),
+    )
+    tags = _harvest_tags(
+        "The listener is on port 8443.\n"
+        "※v port 8443\n"
+        "※v MERGE_STALL_TIMEOUT_S 30.0\n"
+        "※t 1 apply the correction\n"
+        "※d 1",
+        3,
+    )
+    check(
+        "known-positive: a grounded journal tag is kept",
+        any(tag.get("kind") == "v" and tag.get("body") == "port 8443" for tag in tags),
+    )
+    check(
+        "known-negative: an invented journal tag is dropped",
+        not any(tag.get("body") == "MERGE_STALL_TIMEOUT_S 30.0" for tag in tags),
+    )
+    check(
+        "known-positive: ※d closes the matching task",
+        _journal_open_tasks([{"tags": tags}]) == [],
+    )
+    check(
+        "known-positive: an unclosed task stays open",
+        [
+            task["id"]
+            for task in _journal_open_tasks(
+                [{"tags": [tag for tag in tags if tag.get("kind") == "t"]}]
+            )
+        ]
+        == ["1"],
+    )
+    handoff_probe = new_state()
+    append_turn(
+        handoff_probe,
+        "please use port 8443 for metrics; see src/metrics/server.py",
+        llm="off",
+        role="user",
+    )
+    handoff_payload = injection_payload(handoff_probe, max_chars=5_000)
+    check(
+        "known-negative: no handoff when the view already shows everything",
+        handoff_payload is not None
+        and "Session handoff (key facts)" not in handoff_payload["additional_context"]
+        and "**Entity Ledger (pinned):**" in handoff_payload["additional_context"],
+    )
+    demoted = new_state()
+    for index in range(20):
+        append_turn(
+            demoted,
+            (
+                f"Turn {index}: the exporter retries with backoff and the pool "
+                f"sits at {index % 7 + 2} shards while we tune the worker. "
+            ) * 3,
+            llm="off",
+            role="assistant",
+        )
+    demoted_view = injection_payload(demoted, max_chars=2_000)
+    check(
+        "known-positive: the handoff restores facts the packed view dropped",
+        demoted_view is not None
+        and "Session handoff (key facts)" in demoted_view["additional_context"]
+        and demoted_view["metadata"]["compactor"]["handoff"]["items"] > 0,
+    )
 
     if verbose:
         for name, ok, detail in checks:
@@ -2818,6 +5846,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reset", action="store_true", help="replace the state with an empty one")
     parser.add_argument("--status", action="store_true", help="print state status as JSON")
     parser.add_argument(
+        "--recall",
+        metavar="ID",
+        help="print the raw turn archived under ID (12+ hex prefix accepted)",
+    )
+    parser.add_argument(
+        "--recall-l3",
+        metavar="ID",
+        dest="recall_l3",
+        help="print the full chunk/master block behind an L3 index id (12+ hex prefix accepted)",
+    )
+    parser.add_argument(
         "--emit-shared-block",
         action="store_true",
         help="freeze ledger + L2 masters into a byte-stable file for multi-agent prefix reuse",
@@ -2850,6 +5889,60 @@ def main(argv: list[str] | None = None) -> int:
         state_path = Path(args.state).expanduser() if args.state else default_state_path()
     except Exception as exc:  # e.g. an unexpandable ~user in APPEND_COMPACT_STATE
         _log_error(f"cannot resolve state path: {exc!r}")
+        return 0
+
+    if args.recall:
+        raw_id = args.recall.strip().lower()
+        content = recall_raw(raw_id)
+        if content is None:
+            print(f"{PLUGIN_NAME}: no verified raw turn for {raw_id!r}", file=sys.stderr)
+            return 1
+        if args.scope:
+            with state_lock(state_path):
+                state = load_state(state_path)
+            in_scope = any(
+                str(chunk.get("raw_id") or "").startswith(raw_id)
+                and _belongs(chunk, args.scope)
+                for chunk in state.get("l1_chunks", [])
+            )
+            if not in_scope:
+                print(
+                    f"{PLUGIN_NAME}: raw turn {raw_id} is not in session {args.scope!r}",
+                    file=sys.stderr,
+                )
+                return 1
+        sys.stdout.write(content)
+        if not content.endswith("\n"):
+            sys.stdout.write("\n")
+        return 0
+
+    if args.recall_l3:
+        content = recall_l3(args.recall_l3)
+        if content is None:
+            print(
+                f"{PLUGIN_NAME}: L3 id {args.recall_l3!r} is missing, malformed, or fails hash verification",
+                file=sys.stderr,
+            )
+            return 1
+        if args.scope:
+            with state_lock(state_path):
+                state = load_state(state_path)
+            full_id = l3_id_for(content)
+            in_scope = any(
+                l3_id_for(str(item.get("block") or "")) == full_id
+                and _belongs(item, args.scope)
+                for collection in ("l1_chunks", "l2_masters")
+                for item in state.get(collection, [])
+            )
+            if not in_scope:
+                print(
+                    f"{PLUGIN_NAME}: L3 block {args.recall_l3!r} is not in session {args.scope!r}",
+                    file=sys.stderr,
+                )
+                return 1
+        sys.stdout.write(content)
+        if not content.endswith("\n"):
+            sys.stdout.write("\n")
         return 0
 
     if args.worker:
