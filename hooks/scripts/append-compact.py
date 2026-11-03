@@ -5387,6 +5387,40 @@ def _preservation_instructions(state: dict[str, Any], session: str | None = None
     return text
 
 
+def _record_injection_stats(event: str, session: str, output: dict[str, Any] | None) -> None:
+    """Append one counts-only line per injection; never content, never raises."""
+    if not output:
+        return
+    try:
+        meta = (output.get("metadata") or {}).get("compactor") or {}
+        text = (output.get("hookSpecificOutput") or {}).get("additionalContext") or ""
+        record = {
+            "ts": _now(),
+            "plugin": PLUGIN_NAME,
+            "version": VERSION,
+            "event": event,
+            "session": session,
+            "chars": len(text),
+            "budget": meta.get("max_inject_chars"),
+            "l2_masters": meta.get("l2_masters"),
+            "active_l1": meta.get("active_l1"),
+            "dropped_l1": meta.get("dropped_l1"),
+            "dropped_l2": meta.get("dropped_l2"),
+            "pinned_entities": meta.get("pinned_entities"),
+            "l3": meta.get("l3"),
+            "llm_loaded": _compressor is not None,
+            "llm_failed": bool(_compressor_failed),
+        }
+        path = default_cache_dir() / "stats.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size > 50 * 1024 * 1024:
+            path.replace(path.with_name(path.name + ".1"))
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception:
+        return
+
+
 def handle_prompt_event(
     state: dict[str, Any],
     payload: dict[str, Any],
@@ -5406,6 +5440,7 @@ def handle_prompt_event(
         # the prompt is never duplicated back to the model.  Only this
         # session's chunks are eligible.
         output = injection_payload(state, session=session, prompt=prompt)
+        _record_injection_stats("UserPromptSubmit", session, output)
 
     queue_or_append(state, prompt, "user_prompt", session, background, role="user")
 
@@ -5433,6 +5468,7 @@ def handle_sessionstart_event(
     output = None
     if args.force_inject or armed:
         output = injection_payload(state, event_name="SessionStart", session=session)
+        _record_injection_stats("SessionStart", session, output)
     if armed:
         state.get("armed_sessions", {}).pop(session, None)
     state["last_event"] = {
